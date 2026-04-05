@@ -31,5 +31,21 @@ func (h *UserHandler) GetUserForLookup(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(res)
+}
 
+func (h *UserHandler) GetUserStatus(c *fiber.Ctx) error {
+	coreGuardID := c.Params("shadeId")
+	if coreGuardID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "shade ID required"})
+	}
+
+	res, err := h.userService.GetUserStatus(c.UserContext(), coreGuardID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "user not found"})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "an error occurred"})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(res)
 }

@@ -47,6 +47,7 @@ func main() {
 	authHandler := handlers.NewAuthHandler(authService)
 	keyHandler := handlers.NewKeyHandler(keyService)
 	userHandler := handlers.NewUserHandler(userService)
+	auditHandler := handlers.NewAuditHandler(auditRepo)
 
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
@@ -61,6 +62,10 @@ func main() {
 
 	user := v1.Group("/user", middleware.Protected())
 	user.Get("/lookup/:shadeId", userHandler.GetUserForLookup)
+	user.Get("/status/:shadeId", userHandler.GetUserStatus)
+
+	audit := v1.Group("/audit", middleware.Protected())
+	audit.Get("/me", auditHandler.GetMyLogs)
 
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
 

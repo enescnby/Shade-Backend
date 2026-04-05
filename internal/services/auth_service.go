@@ -12,6 +12,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -136,6 +137,7 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 		UserID:      user.UserID,
 		DeviceModel: req.DeviceModel,
 		FCMToken:    req.FCMToken,
+		LastActive:  time.Now(),
 	}
 	if err := s.userRepo.UpdateDevice(user.UserID, newDevice); err != nil {
 		return nil, errors.New("failed to update device information")

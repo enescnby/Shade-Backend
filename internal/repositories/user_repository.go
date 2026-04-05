@@ -18,6 +18,7 @@ type UserRepository interface {
 	GetUserByCoreGuardID(coreGuardID string) (*models.User, error)
 	UpdateDevice(userID uuid.UUID, newDevice *models.UserDevice) error
 	GetUserForLookup(ctx context.Context, coreGuardID string) (*models.User, error)
+	GetUserWithDeviceByShadeID(ctx context.Context, coreGuardID string) (*models.User, error)
 }
 
 type userRepository struct {
@@ -109,4 +110,24 @@ func (r *userRepository) GetUserForLookup(ctx context.Context, coreGuardID strin
 	}
 
 	return &user, err
+}
+
+func (r *userRepository) GetUserWithDeviceByShadeID(ctx context.Context, coreGuardID string) (*models.User, error) {
+	var user models.User
+
+	err := r.db.WithContext(ctx).
+		Preload("Device").
+		Where("core_guard_id = ?", coreGuardID).
+		First(&user).Error
+
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			logger.Log.Warn("user not found for status", zap.String("core_guard_id", coreGuardID))
+			return nil, err
+		}
+		logger.Log.Error("database error while fetching user status", zap.Error(err))
+		return nil, err
+	}
+
+	return &user, nil
 }
