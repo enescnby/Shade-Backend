@@ -53,7 +53,9 @@ func Migrate() {
 		&models.UserDevice{},
 		&models.EncryptedMessages{},
 		&models.DeliveryStatus{},
+		&models.PendingReceipt{},
 		&models.SecurityAuditLog{},
+		&models.ImageMetaData{},
 	)
 
 	if err != nil {

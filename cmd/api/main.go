@@ -2,6 +2,7 @@ package main
 
 import (
 	"core-backend/pkg/firebase"
+	"core-backend/pkg/storage"
 	"log"
 
 	"github.com/gofiber/fiber/v2"
@@ -32,14 +33,19 @@ func main() {
 	firebaseApp := firebase.InitFirebase()
 	firebaseService := services.NewFCMService(firebaseApp)
 
+	r2Client := storage.NewR2Client(&config.AppConfig)
+
 	keyRepo := repositories.NewKeyRepository(database.DB)
 	userRepo := repositories.NewUserRepository(database.DB)
 	auditRepo := repositories.NewAuditRepository(database.DB)
 	msgRepo := repositories.NewMessageRepository(database.DB)
+	mediaRepo := repositories.NewMediaRepository(database.DB, r2Client, config.AppConfig.R2BucketName)
 
 	authService := services.NewAuthService(userRepo, auditRepo)
 	keyService := services.NewKeyService(keyRepo)
 	userService := services.NewUserService(userRepo)
+	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
+	messageService := services.NewMessageService(msgRepo, userRepo)
 
 	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService)
 	wsHandler := handlers.NewWebSocketHandler(cm)
@@ -47,6 +53,8 @@ func main() {
 	authHandler := handlers.NewAuthHandler(authService)
 	keyHandler := handlers.NewKeyHandler(keyService)
 	userHandler := handlers.NewUserHandler(userService)
+	mediaHandler := handlers.NewMediaHandler(mediaService)
+	messageHandler := handlers.NewMessageHandler(messageService, cm)
 
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
@@ -61,6 +69,15 @@ func main() {
 
 	user := v1.Group("/user", middleware.Protected())
 	user.Get("/lookup/:shadeId", userHandler.GetUserForLookup)
+
+	media := v1.Group("/media", middleware.Protected())
+	media.Post("/upload", mediaHandler.Upload)
+	media.Get("/:imageId", mediaHandler.Download)
+
+	messages := v1.Group("/messages", middleware.Protected())
+	messages.Get("/undelivered", messageHandler.GetUndelivered)
+	messages.Post("/receipts", messageHandler.PostReceipts)
+	messages.Get("/receipts/pending", messageHandler.GetPendingReceipts)
 
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
 
