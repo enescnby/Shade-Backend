@@ -56,6 +56,7 @@ func Migrate() {
 		&models.PendingReceipt{},
 		&models.SecurityAuditLog{},
 		&models.ImageMetaData{},
+		&models.WebSession{},
 	)
 
 	if err != nil {
