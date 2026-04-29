@@ -65,7 +65,7 @@ func main() {
 	keyService := services.NewKeyService(keyRepo)
 	userService := services.NewUserService(userRepo)
 	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
-	messageService := services.NewMessageService(msgRepo, userRepo)
+	messageService := services.NewMessageService(rabbitClient)
 	webSessionService := services.NewSessionService(webSessionRepo)
 
 	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService, rabbitClient)
@@ -76,7 +76,7 @@ func main() {
 	keyHandler := handlers.NewKeyHandler(keyService)
 	userHandler := handlers.NewUserHandler(userService)
 	mediaHandler := handlers.NewMediaHandler(mediaService)
-	messageHandler := handlers.NewMessageHandler(messageService, cm)
+	messageHandler := handlers.NewMessageHandler(messageService)
 	webSessionHandler := handlers.NewWebSessionHandler(webSessionService)
 	syncHandler := handlers.NewSyncHandler(syncManager, webSessionService)
 
@@ -104,9 +104,7 @@ func main() {
 	media.Get("/:imageId", mediaHandler.Download)
 
 	messages := v1.Group("/messages", middleware.Protected())
-	messages.Get("/undelivered", messageHandler.GetUndelivered)
-	messages.Post("/receipts", messageHandler.PostReceipts)
-	messages.Get("/receipts/pending", messageHandler.GetPendingReceipts)
+	messages.Get("/inbox", messageHandler.GetInbox)
 
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
 	v1.Get("/ws/sync/:session_id", syncHandler.UpgradeAndServe)

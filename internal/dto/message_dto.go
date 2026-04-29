@@ -1,44 +1,24 @@
 package dto
 
-type EncryptedMessageItem struct {
-	MessageID     string `json:"message_id"`
-	SenderID      string `json:"sender_id"`
-	SenderShadeID string `json:"sender_shade_id"`
-	Ciphertext    string `json:"ciphertext"`
-	Nonce         string `json:"nonce"`
-	MessageType   int    `json:"message_type"`
-	KeyVersion    int    `json:"key_version"`
-	CreatedAt     string `json:"created_at"`
+type InboxMessage struct {
+	MessageID   string `json:"message_id"`
+	SenderID    string `json:"sender_id"`
+	ReceiverID  string `json:"receiver_id"`
+	Ciphertext  []byte `json:"ciphertext"`
+	Nonce       []byte `json:"nonce"`
+	MessageType int32  `json:"message_type"`
+	Timestamp   int64  `json:"timestamp"`
 }
 
-type UndeliveredResponse struct {
-	Messages []EncryptedMessageItem `json:"messages"`
+type InboxReceipt struct {
+	MessageID  string `json:"message_id"`
+	SenderID   string `json:"sender_id"`
+	ReceiverID string `json:"receiver_id"`
+	Status     string `json:"status"`
+	Timestamp  int64  `json:"timestamp"`
 }
 
-type ReceiptRequest struct {
-	MessageID string `json:"message_id"`
-	Status    string `json:"status"`
-}
-
-type BatchReceiptRequest struct {
-	Receipts []ReceiptRequest `json:"receipts"`
-}
-
-type PendingReceiptItem struct {
-	MessageID string `json:"message_id"`
-	Status    string `json:"status"`
-	Timestamp int64  `json:"timestamp"`
-}
-
-type PendingReceiptsResponse struct {
-	Receipts []PendingReceiptItem `json:"receipts"`
-}
-
-type ReceiptEvent struct {
-	MessageID     string
-	SenderID      string
-	SenderShadeID string
-	ReceiverID    string
-	Status        string
-	Timestamp     int64
+type InboxResponse struct {
+	Messages []InboxMessage `json:"messages"`
+	Receipts []InboxReceipt `json:"receipts"`
 }
