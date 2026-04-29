@@ -19,6 +19,12 @@ type Config struct {
 	DBTimeZone string
 	JWTSecret  string
 
+	RabbitMQHost     string
+	RabbitMQPort     string
+	RabbitMQUser     string
+	RabbitMQPassword string
+	RabbitMQVHost    string
+
 	R2AccountID    string
 	R2AccessKeyID  string
 	R2AccessSecret string
@@ -43,6 +49,12 @@ func LoadConfig() {
 		DBSSLMode:  getEnv("DB_SSL_MODE", "disable"),
 		DBTimeZone: getEnv("DB_TIMEZONE", "Europe/Istanbul"),
 		JWTSecret:  getEnv("JWT_SECRET", ""),
+
+		RabbitMQHost:     getEnv("RABBITMQ_HOST", "localhost"),
+		RabbitMQPort:     getEnv("RABBITMQ_PORT", "5672"),
+		RabbitMQUser:     getEnv("RABBITMQ_USER", "guest"),
+		RabbitMQPassword: getEnv("RABBITMQ_PASSWORD", "guest"),
+		RabbitMQVHost:    getEnv("RABBITMQ_VHOST", "/"),
 
 		R2AccountID:    getEnv("R2_ACCOUNT_ID", ""),
 		R2AccessKeyID:  getEnv("R2_ACCESS_KEY_ID", ""),

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"core-backend/internal/rabbitmq"
 	"core-backend/pkg/firebase"
 	"core-backend/pkg/storage"
 	"log"
@@ -29,12 +30,22 @@ func main() {
 
 	database.Migrate()
 
+	rabbitClient, err := rabbitmq.NewClient(config.AppConfig)
+	if err != nil {
+		log.Fatalf("failed to connect rabbitmq: %v", err)
+	}
+	defer rabbitClient.Close()
+
+	if err := rabbitmq.DeclareTopology(rabbitClient); err != nil {
+		log.Fatalf("failed to declare rabbitmq topology: %v", err)
+	}
+
 	app := fiber.New()
 
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     "http://localhost:5173",
-		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
+		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		AllowCredentials: true,
 	}))
 
@@ -57,7 +68,7 @@ func main() {
 	messageService := services.NewMessageService(msgRepo, userRepo)
 	webSessionService := services.NewSessionService(webSessionRepo)
 
-	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService)
+	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService, rabbitClient)
 	wsHandler := handlers.NewWebSocketHandler(cm)
 	syncManager := websocket.NewSyncManager()
 

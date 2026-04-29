@@ -66,6 +66,6 @@ func (r *webSessionRepository) Authorize(id uuid.UUID, ciphertext, nonce, androi
 }
 
 func (r *webSessionRepository) DeleteExpired() error {
-	return r.db.Where("expires at < ?",
+	return r.db.Where("expires_at < ?",
 		time.Now()).Delete(&models.WebSession{}).Error
 }
