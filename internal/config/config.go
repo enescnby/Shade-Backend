@@ -18,6 +18,12 @@ type Config struct {
 	DBSSLMode  string
 	DBTimeZone string
 	JWTSecret  string
+
+	RabbitMQHost     string
+	RabbitMQPort     string
+	RabbitMQUser     string
+	RabbitMQPassword string
+	RabbitMQVHost    string
 }
 
 var AppConfig Config
@@ -38,6 +44,12 @@ func LoadConfig() {
 		DBSSLMode:  getEnv("DB_SSL_MODE", "disable"),
 		DBTimeZone: getEnv("DB_TIMEZONE", "Europe/Istanbul"),
 		JWTSecret:  getEnv("JWT_SECRET", ""),
+
+		RabbitMQHost:     getEnv("RABBITMQ_HOST", "localhost"),
+		RabbitMQPort:     getEnv("RABBITMQ_PORT", "5672"),
+		RabbitMQUser:     getEnv("RABBITMQ_USER", "guest"),
+		RabbitMQPassword: getEnv("RABBITMQ_PASSWORD", "guest"),
+		RabbitMQVHost:    getEnv("RABBITMQ_VHOST", "/"),
 	}
 
 	logger.Log.Info("Configuration successfully imported!")
