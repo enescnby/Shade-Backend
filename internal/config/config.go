@@ -24,6 +24,11 @@ type Config struct {
 	RabbitMQUser     string
 	RabbitMQPassword string
 	RabbitMQVHost    string
+
+	R2AccountID    string
+	R2AccessKeyID  string
+	R2AccessSecret string
+	R2BucketName   string
 }
 
 var AppConfig Config
@@ -50,6 +55,11 @@ func LoadConfig() {
 		RabbitMQUser:     getEnv("RABBITMQ_USER", "guest"),
 		RabbitMQPassword: getEnv("RABBITMQ_PASSWORD", "guest"),
 		RabbitMQVHost:    getEnv("RABBITMQ_VHOST", "/"),
+
+		R2AccountID:    getEnv("R2_ACCOUNT_ID", ""),
+		R2AccessKeyID:  getEnv("R2_ACCESS_KEY_ID", ""),
+		R2AccessSecret: getEnv("R2_ACCESS_SECRET", ""),
+		R2BucketName:   getEnv("R2_BUCKET_NAME", ""),
 	}
 
 	logger.Log.Info("Configuration successfully imported!")

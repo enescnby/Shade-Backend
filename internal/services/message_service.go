@@ -3,142 +3,200 @@ package services
 import (
 	"context"
 	"core-backend/internal/dto"
-	"core-backend/internal/rabbitmq"
-	"core-backend/pb"
+	"core-backend/internal/models"
+	"core-backend/internal/repositories"
 	"core-backend/pkg/logger"
+	"encoding/base64"
+	"strings"
 	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
-	"google.golang.org/protobuf/proto"
-)
-
-const (
-	defaultDrainLimit = 100
-	maxDrainLimit     = 500
-	receiptPublishTTL = 5 * time.Second
 )
 
 type MessageService interface {
-	DrainInbox(userID string, limit int) (*dto.InboxResponse, error)
+	GetUndeliveredMessages(ctx context.Context, userId string) (*dto.UndeliveredResponse, error)
+	GetUserShadeID(ctx context.Context, userID string) (string, error)
+	BuildReceiptEvents(ctx context.Context, userID string, messageIDs []string, status string) ([]dto.ReceiptEvent, error)
+	SavePendingReceipts(ctx context.Context, events []dto.ReceiptEvent) error
+	GetPendingReceipts(ctx context.Context, userID string) (*dto.PendingReceiptsResponse, error)
 }
 
 type messageService struct {
-	rabbit *rabbitmq.Client
+	msgRepo repositories.MessageRepository
+	usrRepo repositories.UserRepository
 }
 
-func NewMessageService(rabbit *rabbitmq.Client) MessageService {
-	return &messageService{rabbit: rabbit}
+func NewMessageService(msgRepo repositories.MessageRepository, usrRepo repositories.UserRepository) MessageService {
+	return &messageService{msgRepo: msgRepo, usrRepo: usrRepo}
 }
 
-func (s *messageService) DrainInbox(userID string, limit int) (*dto.InboxResponse, error) {
-	if limit <= 0 {
-		limit = defaultDrainLimit
-	}
-	if limit > maxDrainLimit {
-		limit = maxDrainLimit
-	}
-
-	ch, err := s.rabbit.Channel()
+func (s *messageService) GetUndeliveredMessages(ctx context.Context, userID string) (*dto.UndeliveredResponse, error) {
+	uid, err := uuid.Parse(userID)
 	if err != nil {
 		return nil, err
 	}
-	defer ch.Close()
 
-	queueName := rabbitmq.UserQueueName(userID)
-	response := &dto.InboxResponse{
-		Messages: []dto.InboxMessage{},
-		Receipts: []dto.InboxReceipt{},
+	messages, err := s.msgRepo.GetUndeliveredMessages(ctx, uid)
+	if err != nil {
+		logger.Log.Error("failed to get undelivered messages", zap.Error(err))
+		return nil, err
 	}
 
-	for i := 0; i < limit; i++ {
-		delivery, ok, err := ch.Get(queueName, false)
+	ids := make([]uuid.UUID, 0, len(messages))
+	items := make([]dto.EncryptedMessageItem, 0, len(messages))
+
+	senderShadeIDCache := make(map[uuid.UUID]string)
+
+	for _, msg := range messages {
+		ids = append(ids, msg.MessageID)
+		shadeID, ok := senderShadeIDCache[msg.SenderID]
+		if !ok {
+			sender, err := s.usrRepo.GetUserByID(msg.SenderID)
+			if err != nil {
+				continue
+			}
+			shadeID = sender.CoreGuardID
+			senderShadeIDCache[msg.SenderID] = shadeID
+		}
+		items = append(items, dto.EncryptedMessageItem{
+			MessageID:     msg.MessageID.String(),
+			SenderID:      msg.SenderID.String(),
+			SenderShadeID: shadeID,
+			Ciphertext:    base64.StdEncoding.EncodeToString(msg.Ciphertext),
+			Nonce:         base64.StdEncoding.EncodeToString(msg.Nonce),
+			MessageType:   msg.MessageType,
+			KeyVersion:    msg.KeyVersion,
+			CreatedAt:     msg.CreatedAt.Format(time.RFC3339),
+		})
+	}
+
+	if len(ids) > 0 {
+		_ = s.msgRepo.MarkAsDelivered(ids)
+	}
+
+	return &dto.UndeliveredResponse{Messages: items}, nil
+}
+
+func (s *messageService) GetUserShadeID(ctx context.Context, userID string) (string, error) {
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return "", err
+	}
+	user, err := s.usrRepo.GetUserByID(uid)
+	if err != nil {
+		return "", err
+	}
+	return user.CoreGuardID, nil
+}
+
+func (s *messageService) BuildReceiptEvents(ctx context.Context, userID string, messageIDs []string, status string) ([]dto.ReceiptEvent, error) {
+	if len(messageIDs) == 0 {
+		return []dto.ReceiptEvent{}, nil
+	}
+
+	currentUserUUID, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]uuid.UUID, 0, len(messageIDs))
+	for _, rawID := range messageIDs {
+		parsed, err := uuid.Parse(rawID)
 		if err != nil {
 			return nil, err
 		}
-		if !ok {
-			break
-		}
-
-		var wrapper pb.WebSocketMessage
-		if err := proto.Unmarshal(delivery.Body, &wrapper); err != nil {
-			logger.Log.Warn("inbox: broken protobuf, dropping",
-				zap.String("user_id", userID), zap.Error(err))
-			_ = delivery.Nack(false, false)
-			continue
-		}
-
-		switch content := wrapper.Content.(type) {
-		case *pb.WebSocketMessage_Payload:
-			p := content.Payload
-			response.Messages = append(response.Messages, dto.InboxMessage{
-				MessageID:   p.MessageId,
-				SenderID:    p.SenderId,
-				ReceiverID:  p.ReceiverId,
-				Ciphertext:  p.Ciphertext,
-				Nonce:       p.Nonce,
-				MessageType: int32(p.Type),
-				Timestamp:   delivery.Timestamp.Unix(),
-			})
-
-			if err := s.publishDeliveredReceipt(ch, p.MessageId, userID, p.SenderId); err != nil {
-				logger.Log.Warn("auto delivered receipt publish failed",
-					zap.String("user_id", userID),
-					zap.String("msg_id", p.MessageId), zap.Error(err))
-			}
-
-		case *pb.WebSocketMessage_Receipt:
-			r := content.Receipt
-			response.Receipts = append(response.Receipts, dto.InboxReceipt{
-				MessageID:  r.MessageId,
-				ReceiverID: r.ReceiverId,
-				Status:     r.Status.String(),
-				Timestamp:  delivery.Timestamp.Unix(),
-			})
-		}
-
-		_ = delivery.Ack(false)
+		ids = append(ids, parsed)
 	}
 
-	logger.Log.Info("inbox drained",
-		zap.String("user_id", userID),
-		zap.Int("messages", len(response.Messages)),
-		zap.Int("receipts", len(response.Receipts)))
+	messages, err := s.msgRepo.GetMessagesByIDsForReceiver(ctx, currentUserUUID, ids)
+	if err != nil {
+		logger.Log.Error("failed to build receipt events", zap.Error(err))
+		return nil, err
+	}
 
-	return response, nil
+	user, err := s.usrRepo.GetUserByID(currentUserUUID)
+	if err != nil {
+		return nil, err
+	}
+
+	status = strings.ToUpper(strings.TrimSpace(status))
+	now := time.Now().UnixMilli()
+
+	events := make([]dto.ReceiptEvent, 0, len(messages))
+	for _, msg := range messages {
+		events = append(events, dto.ReceiptEvent{
+			MessageID:     msg.MessageID.String(),
+			SenderID:      userID,
+			SenderShadeID: user.CoreGuardID,
+			ReceiverID:    msg.SenderID.String(),
+			Status:        status,
+			Timestamp:     now,
+		})
+	}
+
+	return events, nil
 }
 
-func (s *messageService) publishDeliveredReceipt(ch *amqp.Channel, msgID, fromUserID, toSenderID string) error {
-	receipt := &pb.WebSocketMessage{
-		Content: &pb.WebSocketMessage_Receipt{
-			Receipt: &pb.DeliveryReceipt{
-				MessageId:  msgID,
-				SenderId:   fromUserID,
-				ReceiverId: toSenderID,
-				Status:     pb.ReceiptStatus_DELIVERED,
-				Timestamp:  time.Now().Unix(),
-			},
-		},
+func (s *messageService) SavePendingReceipts(ctx context.Context, events []dto.ReceiptEvent) error {
+	if len(events) == 0 {
+		return nil
 	}
 
-	body, err := proto.Marshal(receipt)
+	receipts := make([]models.PendingReceipt, 0, len(events))
+	for _, event := range events {
+		userID, err := uuid.Parse(event.ReceiverID)
+		if err != nil {
+			return err
+		}
+		fromUserID, err := uuid.Parse(event.SenderID)
+		if err != nil {
+			return err
+		}
+		messageID, err := uuid.Parse(event.MessageID)
+		if err != nil {
+			return err
+		}
+		receipts = append(receipts, models.PendingReceipt{
+			UserID:     userID,
+			FromUserID: fromUserID,
+			MessageID:  messageID,
+			Status:     strings.ToUpper(strings.TrimSpace(event.Status)),
+			Timestamp:  time.UnixMilli(event.Timestamp),
+		})
+	}
+
+	return s.msgRepo.SavePendingReceipts(receipts)
+}
+
+func (s *messageService) GetPendingReceipts(ctx context.Context, userID string) (*dto.PendingReceiptsResponse, error) {
+	uid, err := uuid.Parse(userID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), receiptPublishTTL)
-	defer cancel()
+	receipts, err := s.msgRepo.GetPendingReceipts(uid)
+	if err != nil {
+		return nil, err
+	}
 
-	return ch.PublishWithContext(ctx,
-		rabbitmq.ExchangeUser,
-		toSenderID,
-		false,
-		false,
-		amqp.Publishing{
-			ContentType:  "application/octet-stream",
-			Body:         body,
-			DeliveryMode: amqp.Persistent,
-			Timestamp:    time.Now(),
-		},
-	)
+	items := make([]dto.PendingReceiptItem, 0, len(receipts))
+	ids := make([]int, 0, len(receipts))
+
+	for _, receipt := range receipts {
+		ids = append(ids, receipt.ReceiptID)
+		items = append(items, dto.PendingReceiptItem{
+			MessageID: receipt.MessageID.String(),
+			Status:    receipt.Status,
+			Timestamp: receipt.Timestamp.UnixMilli(),
+		})
+	}
+
+	if len(ids) > 0 {
+		if err := s.msgRepo.DeletePendingReceipts(ids); err != nil {
+			return nil, err
+		}
+	}
+
+	return &dto.PendingReceiptsResponse{Receipts: items}, nil
 }

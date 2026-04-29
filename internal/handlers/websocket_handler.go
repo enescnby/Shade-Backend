@@ -52,6 +52,7 @@ func (h *WebSocketHandler) handleConn(conn *websocket.Conn) {
 	}
 
 	h.cm.Register(userID, conn)
+	h.cm.FlushPendingReceipts(userID)
 	defer h.cm.Unregister(userID)
 
 	h.cm.ReadPump(userID, conn)
