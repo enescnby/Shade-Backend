@@ -27,6 +27,15 @@ type DeliveryStatus struct {
 	Details     string `gorm:"type:text"`
 }
 
+type PendingReceipt struct {
+	ReceiptID  int       `gorm:"primaryKey;autoIncrement"`
+	UserID     uuid.UUID `gorm:"type:uuid;index;not null"`
+	MessageID  uuid.UUID `gorm:"type:uuid;index;not null"`
+	FromUserID uuid.UUID `gorm:"type:uuid;index;not null"`
+	Status     string    `gorm:"type:varchar(16);not null"`
+	Timestamp  time.Time `gorm:"not null"`
+}
+
 type SecurityAuditLog struct {
 	AuditID    int       `gorm:"primaryKey;autoIncrement"`
 	UserID     uuid.UUID `gorm:"type:uuid;index;not null"`
