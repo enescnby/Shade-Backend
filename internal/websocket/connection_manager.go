@@ -25,12 +25,14 @@ const (
 	userAckTimeout     = 30 * time.Second
 	pingInterval       = 20 * time.Second
 	pongWait           = 30 * time.Second
+
+	headerSourceConnID = "x-source-conn-id"
 )
 
 type ConnectionManager interface {
-	Register(userID string, conn *websocket.Conn)
-	ReadPump(userID string, conn *websocket.Conn)
-	Unregister(userID string)
+	Register(userID string, conn *websocket.Conn) string
+	ReadPump(userID, connID string, conn *websocket.Conn)
+	Unregister(userID, connID string)
 }
 
 type pendingDelivery struct {
@@ -38,9 +40,18 @@ type pendingDelivery struct {
 	timer       *time.Timer
 }
 
-type clientState struct {
-	conn           *websocket.Conn
-	writeMu        sync.Mutex
+type connState struct {
+	connID  string
+	conn    *websocket.Conn
+	writeMu sync.Mutex
+}
+
+type userState struct {
+	userID string
+
+	connsMu sync.RWMutex
+	conns   map[string]*connState
+
 	consumerCancel context.CancelFunc
 
 	chMu sync.Mutex
@@ -50,26 +61,26 @@ type clientState struct {
 	pendingAcks map[string]*pendingDelivery
 }
 
-func (cs *clientState) ack(deliveryTag uint64) error {
-	cs.chMu.Lock()
-	defer cs.chMu.Unlock()
-	if cs.ch == nil {
+func (us *userState) ack(deliveryTag uint64) error {
+	us.chMu.Lock()
+	defer us.chMu.Unlock()
+	if us.ch == nil {
 		return nil
 	}
-	return cs.ch.Ack(deliveryTag, false)
+	return us.ch.Ack(deliveryTag, false)
 }
 
-func (cs *clientState) nack(deliveryTag uint64, requeue bool) error {
-	cs.chMu.Lock()
-	defer cs.chMu.Unlock()
-	if cs.ch == nil {
+func (us *userState) nack(deliveryTag uint64, requeue bool) error {
+	us.chMu.Lock()
+	defer us.chMu.Unlock()
+	if us.ch == nil {
 		return nil
 	}
-	return cs.ch.Nack(deliveryTag, false, requeue)
+	return us.ch.Nack(deliveryTag, false, requeue)
 }
 
 type connectionManager struct {
-	clients    map[string]*clientState
+	clients    map[string]*userState
 	mu         sync.RWMutex
 	msgRepo    repositories.MessageRepository
 	userRepo   repositories.UserRepository
@@ -84,7 +95,7 @@ func NewConnectionManager(
 	rabbit *rabbitmq.Client,
 ) ConnectionManager {
 	return &connectionManager{
-		clients:    make(map[string]*clientState),
+		clients:    make(map[string]*userState),
 		msgRepo:    msgRepo,
 		userRepo:   userRepo,
 		fcmService: fcmService,
@@ -107,44 +118,60 @@ func (m *connectionManager) declareUserQueue(userID string, ch *amqp.Channel) er
 	return ch.QueueBind(queueName, userID, rabbitmq.ExchangeUser, false, nil)
 }
 
-func (m *connectionManager) Register(userID string, conn *websocket.Conn) {
-	ch, err := m.rabbit.Channel()
-	if err != nil {
-		logger.Log.Error("user channel open failed",
-			zap.String("user_id", userID), zap.Error(err))
-		return
-	}
-
-	if err := m.declareUserQueue(userID, ch); err != nil {
-		logger.Log.Error("user queue declare failed",
-			zap.String("user_id", userID), zap.Error(err))
-		_ = ch.Close()
-		return
-	}
-
-	state := &clientState{
-		conn:        conn,
-		ch:          ch,
-		pendingAcks: make(map[string]*pendingDelivery),
-	}
+func (m *connectionManager) Register(userID string, conn *websocket.Conn) string {
+	connID := uuid.NewString()
+	cs := &connState{connID: connID, conn: conn}
 
 	m.mu.Lock()
-	if existing, ok := m.clients[userID]; ok {
-		go m.cleanupClientState(userID, existing)
+	us, ok := m.clients[userID]
+	if !ok {
+		ch, err := m.rabbit.Channel()
+		if err != nil {
+			m.mu.Unlock()
+			logger.Log.Error("user channel open failed",
+				zap.String("user_id", userID), zap.Error(err))
+			_ = conn.Close()
+			return connID
+		}
+
+		if err := m.declareUserQueue(userID, ch); err != nil {
+			m.mu.Unlock()
+			logger.Log.Error("user queue declare failed",
+				zap.String("user_id", userID), zap.Error(err))
+			_ = ch.Close()
+			_ = conn.Close()
+			return connID
+		}
+
+		us = &userState{
+			userID:      userID,
+			conns:       make(map[string]*connState),
+			ch:          ch,
+			pendingAcks: make(map[string]*pendingDelivery),
+		}
+		m.clients[userID] = us
+		m.startUserConsumer(us)
 	}
-	m.clients[userID] = state
+
+	us.connsMu.Lock()
+	us.conns[connID] = cs
+	deviceCount := len(us.conns)
+	us.connsMu.Unlock()
 	m.mu.Unlock()
 
-	m.setupHeartbeat(userID, state)
-	m.startUserConsumer(userID, state)
+	m.setupHeartbeat(userID, cs)
 
-	logger.Log.Info("user connected to WebSocket", zap.String("user_id", userID))
+	logger.Log.Info("user device connected",
+		zap.String("user_id", userID),
+		zap.String("conn_id", connID),
+		zap.Int("device_count", deviceCount))
+	return connID
 }
 
-func (m *connectionManager) setupHeartbeat(userID string, state *clientState) {
-	_ = state.conn.SetReadDeadline(time.Now().Add(pongWait))
-	state.conn.SetPongHandler(func(string) error {
-		_ = state.conn.SetReadDeadline(time.Now().Add(pongWait))
+func (m *connectionManager) setupHeartbeat(userID string, cs *connState) {
+	_ = cs.conn.SetReadDeadline(time.Now().Add(pongWait))
+	cs.conn.SetPongHandler(func(string) error {
+		_ = cs.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
 
@@ -153,34 +180,42 @@ func (m *connectionManager) setupHeartbeat(userID string, state *clientState) {
 		defer ticker.Stop()
 
 		for range ticker.C {
-			state.writeMu.Lock()
-			err := state.conn.WriteControl(
+			cs.writeMu.Lock()
+			err := cs.conn.WriteControl(
 				websocket.PingMessage,
 				nil,
 				time.Now().Add(5*time.Second),
 			)
-			state.writeMu.Unlock()
+			cs.writeMu.Unlock()
 			if err != nil {
 				logger.Log.Info("ping failed, closing",
-					zap.String("user_id", userID), zap.Error(err))
-				_ = state.conn.Close()
+					zap.String("user_id", userID),
+					zap.String("conn_id", cs.connID),
+					zap.Error(err))
+				_ = cs.conn.Close()
 				return
 			}
 		}
 	}()
 }
 
-func (m *connectionManager) startUserConsumer(userID string, state *clientState) {
+func (m *connectionManager) startUserConsumer(us *userState) {
 	ctx, cancel := context.WithCancel(context.Background())
-	state.consumerCancel = cancel
-	go m.consumeUserQueue(ctx, userID, state)
+	us.consumerCancel = cancel
+	go m.consumeUserQueue(ctx, us)
 }
 
-func (m *connectionManager) consumeUserQueue(ctx context.Context, userID string, state *clientState) {
-	queueName := rabbitmq.UserQueueName(userID)
+func (m *connectionManager) consumeUserQueue(ctx context.Context, us *userState) {
+	queueName := rabbitmq.UserQueueName(us.userID)
 
-	state.chMu.Lock()
-	deliveries, err := state.ch.Consume(
+	us.chMu.Lock()
+	ch := us.ch
+	us.chMu.Unlock()
+	if ch == nil {
+		return
+	}
+
+	deliveries, err := ch.Consume(
 		queueName,
 		"",
 		false,
@@ -189,98 +224,135 @@ func (m *connectionManager) consumeUserQueue(ctx context.Context, userID string,
 		false,
 		nil,
 	)
-	state.chMu.Unlock()
-
 	if err != nil {
 		logger.Log.Error("user consume failed",
-			zap.String("user_id", userID), zap.Error(err))
+			zap.String("user_id", us.userID), zap.Error(err))
 		return
 	}
 
-	logger.Log.Info("user consumer started", zap.String("user_id", userID))
+	logger.Log.Info("user consumer started", zap.String("user_id", us.userID))
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Log.Info("user consumer cancelled", zap.String("user_id", userID))
+			logger.Log.Info("user consumer cancelled", zap.String("user_id", us.userID))
 			return
 
 		case delivery, ok := <-deliveries:
 			if !ok {
-				logger.Log.Info("user consumer channel closed", zap.String("user_id", userID))
+				logger.Log.Info("user consumer channel closed", zap.String("user_id", us.userID))
 				return
 			}
-			m.handleDelivery(userID, state, delivery)
+			m.handleDelivery(us, delivery)
 		}
 	}
 }
 
-func (m *connectionManager) handleDelivery(userID string, state *clientState, delivery amqp.Delivery) {
+func (m *connectionManager) handleDelivery(us *userState, delivery amqp.Delivery) {
 	var wrapper pb.WebSocketMessage
 	if err := proto.Unmarshal(delivery.Body, &wrapper); err != nil {
 		logger.Log.Warn("delivery: broken protobuf, dropping",
-			zap.String("user_id", userID), zap.Error(err))
-		_ = state.nack(delivery.DeliveryTag, false)
+			zap.String("user_id", us.userID), zap.Error(err))
+		_ = us.nack(delivery.DeliveryTag, false)
 		return
 	}
 
-	state.writeMu.Lock()
-	_ = state.conn.SetWriteDeadline(time.Now().Add(userWriteTimeout))
-	writeErr := state.conn.WriteMessage(websocket.BinaryMessage, delivery.Body)
-	_ = state.conn.SetWriteDeadline(time.Time{})
-	state.writeMu.Unlock()
+	skipConnID := ""
+	if delivery.Headers != nil {
+		if v, ok := delivery.Headers[headerSourceConnID]; ok {
+			if s, ok := v.(string); ok {
+				skipConnID = s
+			}
+		}
+	}
 
-	if writeErr != nil {
+	us.connsMu.RLock()
+	targets := make([]*connState, 0, len(us.conns))
+	for _, cs := range us.conns {
+		if cs.connID == skipConnID {
+			continue
+		}
+		targets = append(targets, cs)
+	}
+	us.connsMu.RUnlock()
+
+	if len(targets) == 0 {
+		_ = us.nack(delivery.DeliveryTag, true)
+		return
+	}
+
+	deliveredTo := 0
+	for _, cs := range targets {
+		cs.writeMu.Lock()
+		_ = cs.conn.SetWriteDeadline(time.Now().Add(userWriteTimeout))
+		writeErr := cs.conn.WriteMessage(websocket.BinaryMessage, delivery.Body)
+		_ = cs.conn.SetWriteDeadline(time.Time{})
+		cs.writeMu.Unlock()
+
+		if writeErr == nil {
+			deliveredTo++
+			continue
+		}
+
 		logger.Log.Error("user message forward failed",
-			zap.String("user_id", userID), zap.Error(writeErr))
-		_ = state.nack(delivery.DeliveryTag, true)
-		_ = state.conn.Close()
+			zap.String("user_id", us.userID),
+			zap.String("conn_id", cs.connID),
+			zap.Error(writeErr))
+		_ = cs.conn.Close()
+	}
+
+	if deliveredTo == 0 {
+		_ = us.nack(delivery.DeliveryTag, true)
 		return
 	}
 
 	payload, isPayload := wrapper.Content.(*pb.WebSocketMessage_Payload)
 	if !isPayload {
-		_ = state.ack(delivery.DeliveryTag)
+		_ = us.ack(delivery.DeliveryTag)
 		logger.Log.Info("non-payload forwarded",
-			zap.String("user_id", userID),
-			zap.Int("payload_bytes", len(delivery.Body)))
+			zap.String("user_id", us.userID),
+			zap.Int("recipients", deliveredTo))
 		return
 	}
 
 	msgID := payload.Payload.MessageId
 
-	state.pendingMu.Lock()
+	us.pendingMu.Lock()
 	timer := time.AfterFunc(userAckTimeout, func() {
-		state.pendingMu.Lock()
-		pending, exists := state.pendingAcks[msgID]
+		us.pendingMu.Lock()
+		pending, exists := us.pendingAcks[msgID]
 		if exists {
-			delete(state.pendingAcks, msgID)
+			delete(us.pendingAcks, msgID)
 		}
-		state.pendingMu.Unlock()
+		us.pendingMu.Unlock()
 
 		if exists {
-			logger.Log.Warn("ack timeout, requeue + close",
-				zap.String("user_id", userID), zap.String("msg_id", msgID))
-			_ = state.nack(pending.deliveryTag, true)
-			_ = state.conn.Close()
+			logger.Log.Warn("ack timeout, requeue",
+				zap.String("user_id", us.userID),
+				zap.String("msg_id", msgID))
+			_ = us.nack(pending.deliveryTag, true)
 		}
 	})
-	state.pendingAcks[msgID] = &pendingDelivery{
+	us.pendingAcks[msgID] = &pendingDelivery{
 		deliveryTag: delivery.DeliveryTag,
 		timer:       timer,
 	}
-	state.pendingMu.Unlock()
+	us.pendingMu.Unlock()
 
 	logger.Log.Info("message forwarded, awaiting client ack",
-		zap.String("user_id", userID), zap.String("msg_id", msgID))
+		zap.String("user_id", us.userID),
+		zap.String("msg_id", msgID),
+		zap.Int("recipients", deliveredTo))
 }
 
-func (m *connectionManager) ReadPump(userID string, conn *websocket.Conn) {
+func (m *connectionManager) ReadPump(userID, connID string, conn *websocket.Conn) {
 	for {
 		messageType, rawPayload, err := conn.ReadMessage()
 		if err != nil {
 			logger.Log.Info("user tunnel disconnected",
-				zap.String("user_id", userID), zap.Error(err))
+				zap.String("user_id", userID),
+				zap.String("conn_id", connID),
+				zap.Error(err))
 			break
 		}
 
@@ -298,19 +370,26 @@ func (m *connectionManager) ReadPump(userID string, conn *websocket.Conn) {
 
 		switch msg := wrapper.Content.(type) {
 		case *pb.WebSocketMessage_Payload:
-			m.handlePayload(userID, msg.Payload, rawPayload)
+			m.handlePayload(userID, connID, msg.Payload, rawPayload)
 		case *pb.WebSocketMessage_Receipt:
-			m.handleReceipt(userID, msg.Receipt, rawPayload)
+			m.handleReceipt(userID, connID, msg.Receipt, rawPayload)
 		}
 	}
 }
 
-func (m *connectionManager) handlePayload(senderID string, payload *pb.EncryptedPayload, rawPayload []byte) {
+func (m *connectionManager) handlePayload(senderID, senderConnID string, payload *pb.EncryptedPayload, rawPayload []byte) {
 	receiverID := payload.ReceiverId
 
 	ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
-	publishErr := m.publishToUser(ctx, receiverID, rawPayload)
+	publishErr := m.publishToUser(ctx, receiverID, rawPayload, "")
 	cancel()
+
+	echoCtx, echoCancel := context.WithTimeout(context.Background(), userPublishTimeout)
+	if echoErr := m.publishToUser(echoCtx, senderID, rawPayload, senderConnID); echoErr != nil {
+		logger.Log.Warn("multi-device echo publish failed",
+			zap.String("user_id", senderID), zap.Error(echoErr))
+	}
+	echoCancel()
 
 	m.mu.RLock()
 	_, isOnline := m.clients[receiverID]
@@ -348,26 +427,26 @@ func (m *connectionManager) handlePayload(senderID string, payload *pb.Encrypted
 	}
 }
 
-func (m *connectionManager) handleReceipt(senderID string, receipt *pb.DeliveryReceipt, rawPayload []byte) {
+func (m *connectionManager) handleReceipt(senderID, senderConnID string, receipt *pb.DeliveryReceipt, rawPayload []byte) {
 	if receipt.Status == pb.ReceiptStatus_DELIVERED {
 		msgUUID, _ := uuid.Parse(receipt.MessageId)
 		_ = m.msgRepo.MarkAsDelivered([]uuid.UUID{msgUUID})
 
 		m.mu.RLock()
-		state, ok := m.clients[senderID]
+		us, ok := m.clients[senderID]
 		m.mu.RUnlock()
 
 		if ok {
-			state.pendingMu.Lock()
-			pending, exists := state.pendingAcks[receipt.MessageId]
+			us.pendingMu.Lock()
+			pending, exists := us.pendingAcks[receipt.MessageId]
 			if exists {
 				pending.timer.Stop()
-				delete(state.pendingAcks, receipt.MessageId)
+				delete(us.pendingAcks, receipt.MessageId)
 			}
-			state.pendingMu.Unlock()
+			us.pendingMu.Unlock()
 
 			if exists {
-				if err := state.ack(pending.deliveryTag); err != nil {
+				if err := us.ack(pending.deliveryTag); err != nil {
 					logger.Log.Error("rabbitmq ack failed",
 						zap.String("user_id", senderID),
 						zap.String("msg_id", receipt.MessageId), zap.Error(err))
@@ -381,20 +460,31 @@ func (m *connectionManager) handleReceipt(senderID string, receipt *pb.DeliveryR
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
-	defer cancel()
-
-	if err := m.publishToUser(ctx, receipt.ReceiverId, rawPayload); err != nil {
+	if err := m.publishToUser(ctx, receipt.ReceiverId, rawPayload, ""); err != nil {
 		logger.Log.Error("receipt publish failed",
 			zap.String("user_id", receipt.ReceiverId), zap.Error(err))
 	}
+	cancel()
+
+	echoCtx, echoCancel := context.WithTimeout(context.Background(), userPublishTimeout)
+	if err := m.publishToUser(echoCtx, senderID, rawPayload, senderConnID); err != nil {
+		logger.Log.Warn("multi-device receipt echo failed",
+			zap.String("user_id", senderID), zap.Error(err))
+	}
+	echoCancel()
 }
 
-func (m *connectionManager) publishToUser(ctx context.Context, receiverID string, payload []byte) error {
+func (m *connectionManager) publishToUser(ctx context.Context, receiverID string, payload []byte, sourceConnID string) error {
 	ch, err := m.rabbit.Channel()
 	if err != nil {
 		return err
 	}
 	defer ch.Close()
+
+	var headers amqp.Table
+	if sourceConnID != "" {
+		headers = amqp.Table{headerSourceConnID: sourceConnID}
+	}
 
 	return ch.PublishWithContext(ctx,
 		rabbitmq.ExchangeUser,
@@ -406,48 +496,67 @@ func (m *connectionManager) publishToUser(ctx context.Context, receiverID string
 			Body:         payload,
 			DeliveryMode: amqp.Persistent,
 			Timestamp:    time.Now(),
+			Headers:      headers,
 		},
 	)
 }
 
-func (m *connectionManager) Unregister(userID string) {
+func (m *connectionManager) Unregister(userID, connID string) {
 	m.mu.Lock()
-	state, exists := m.clients[userID]
+	us, exists := m.clients[userID]
 	if !exists {
 		m.mu.Unlock()
 		return
 	}
-	delete(m.clients, userID)
+
+	us.connsMu.Lock()
+	cs, ok := us.conns[connID]
+	if ok {
+		delete(us.conns, connID)
+	}
+	remaining := len(us.conns)
+	us.connsMu.Unlock()
+
+	lastConn := remaining == 0
+	if lastConn {
+		delete(m.clients, userID)
+	}
 	m.mu.Unlock()
 
-	m.cleanupClientState(userID, state)
-	logger.Log.Info("connection closed, user cleaned from RAM",
-		zap.String("user_id", userID))
+	if ok {
+		_ = cs.conn.Close()
+	}
+
+	if lastConn {
+		m.cleanupUserState(us)
+		logger.Log.Info("user fully disconnected, cleaned from RAM",
+			zap.String("user_id", userID),
+			zap.String("conn_id", connID))
+		return
+	}
+
+	logger.Log.Info("user device disconnected, others still online",
+		zap.String("user_id", userID),
+		zap.String("conn_id", connID),
+		zap.Int("remaining_devices", remaining))
 }
 
-func (m *connectionManager) cleanupClientState(userID string, state *clientState) {
-	if state.consumerCancel != nil {
-		state.consumerCancel()
+func (m *connectionManager) cleanupUserState(us *userState) {
+	if us.consumerCancel != nil {
+		us.consumerCancel()
 	}
 
-	state.pendingMu.Lock()
-	for msgID, pending := range state.pendingAcks {
+	us.pendingMu.Lock()
+	for _, pending := range us.pendingAcks {
 		pending.timer.Stop()
-		if err := state.nack(pending.deliveryTag, true); err != nil {
-			logger.Log.Error("requeue on disconnect failed",
-				zap.String("user_id", userID),
-				zap.String("msg_id", msgID), zap.Error(err))
-		}
 	}
-	state.pendingAcks = nil
-	state.pendingMu.Unlock()
+	us.pendingAcks = nil
+	us.pendingMu.Unlock()
 
-	state.chMu.Lock()
-	if state.ch != nil {
-		_ = state.ch.Close()
-		state.ch = nil
+	us.chMu.Lock()
+	if us.ch != nil {
+		_ = us.ch.Close()
+		us.ch = nil
 	}
-	state.chMu.Unlock()
-
-	_ = state.conn.Close()
+	us.chMu.Unlock()
 }

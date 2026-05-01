@@ -51,10 +51,10 @@ func (h *WebSocketHandler) handleConn(conn *websocket.Conn) {
 		return
 	}
 
-	h.cm.Register(userID, conn)
-	defer h.cm.Unregister(userID)
+	connID := h.cm.Register(userID, conn)
+	defer h.cm.Unregister(userID, connID)
 
-	h.cm.ReadPump(userID, conn)
+	h.cm.ReadPump(userID, connID, conn)
 }
 
 func extractBearerToken(authHeader string) string {
