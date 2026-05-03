@@ -9,10 +9,11 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-func GenerateToken(userID string, coreGuardID string) (string, error) {
+func GenerateToken(userID string, coreGuardID string, deviceID string) (string, error) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id":       userID,
 		"core_guard_id": coreGuardID,
+		"device_id":     deviceID,
 		"exp":           time.Now().Add(time.Hour * 24 * 30).Unix(),
 	})
 
@@ -25,7 +26,7 @@ func GenerateToken(userID string, coreGuardID string) (string, error) {
 	return token.SignedString([]byte(secretKey))
 }
 
-func ParseToken(tokenString string) (string, string, error) {
+func ParseToken(tokenString string) (string, string, string, error) {
 	secretKey := config.AppConfig.JWTSecret
 	if secretKey == "" {
 		logger.Log.Warn("JWT_SECRET is not set in .env file! Using fallback secret.")
@@ -40,16 +41,17 @@ func ParseToken(tokenString string) (string, string, error) {
 	})
 
 	if err != nil {
-		return "", "", errors.New("invalid or expired token")
+		return "", "", "", errors.New("invalid or expired token")
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		return "", "", errors.New("invalid token claims")
+		return "", "", "", errors.New("invalid token claims")
 	}
 
 	userID := claims["user_id"].(string)
 	coreGuardID := claims["core_guard_id"].(string)
+	deviceID := claims["device_id"].(string)
 
-	return userID, coreGuardID, nil
+	return userID, coreGuardID, deviceID, nil
 }

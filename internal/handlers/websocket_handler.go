@@ -32,12 +32,13 @@ func (h *WebSocketHandler) UpgradeAndServe(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing token"})
 	}
 
-	userID, _, err := jwt.ParseToken(token)
-	if err != nil || strings.TrimSpace(userID) == "" {
+	userID, _, deviceID, err := jwt.ParseToken(token)
+	if err != nil || strings.TrimSpace(userID) == "" || strings.TrimSpace(deviceID) == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 
 	c.Locals("userID", userID)
+	c.Locals("device_id", deviceID)
 
 	return websocket.New(h.handleConn)(c)
 }
@@ -45,16 +46,19 @@ func (h *WebSocketHandler) UpgradeAndServe(c *fiber.Ctx) error {
 func (h *WebSocketHandler) handleConn(conn *websocket.Conn) {
 	userID, _ := conn.Locals("userID").(string)
 	userID = strings.TrimSpace(userID)
-	if userID == "" {
+	deviceID, _ := conn.Locals("device_id").(string)
+	deviceID = strings.TrimSpace(deviceID)
+
+	if userID == "" || deviceID == "" {
 		_ = conn.WriteMessage(websocket.CloseMessage, []byte("unauthorized"))
 		_ = conn.Close()
 		return
 	}
 
-	connID := h.cm.Register(userID, conn)
-	defer h.cm.Unregister(userID, connID)
+	connID := h.cm.Register(userID, deviceID, conn)
+	defer h.cm.Unregister(userID, deviceID, connID)
 
-	h.cm.ReadPump(userID, connID, conn)
+	h.cm.ReadPump(userID, deviceID, connID, conn)
 }
 
 func extractBearerToken(authHeader string) string {

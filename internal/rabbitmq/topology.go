@@ -61,3 +61,7 @@ func UserQueueArgs() amqp.Table {
 		"x-message-ttl": int32(userMessageTTLMs),
 	}
 }
+
+func UserDeviceQueueName(userID, deviceID string) string {
+	return UserQueuePrefix + userID + "." + deviceID
+}

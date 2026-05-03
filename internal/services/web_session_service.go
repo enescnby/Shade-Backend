@@ -4,6 +4,7 @@ import (
 	"core-backend/internal/dto"
 	"core-backend/internal/models"
 	"core-backend/internal/repositories"
+	"core-backend/pkg/jwt"
 	"core-backend/pkg/logger"
 	"errors"
 	"sync"
@@ -28,19 +29,21 @@ var (
 type WebSessionService interface {
 	CreateSession() (*dto.CreateSessionResponse, error)
 	PollSession(sessionID string) (*dto.SessionPollResponse, error)
-	AuthorizeSession(sessionID string, req *dto.AuthorizeRequest) error
+	AuthorizeSession(userID uuid.UUID, sessionID string, req *dto.AuthorizeRequest) error
 	GetSession(sessionID string) (*models.WebSession, error)
 }
 
 type webSessionService struct {
 	repo     repositories.WebSessionRepository
+	userRepo repositories.UserRepository
 	mu       sync.Mutex
 	notifyCh map[string]chan struct{}
 }
 
-func NewSessionService(repo repositories.WebSessionRepository) WebSessionService {
+func NewSessionService(repo repositories.WebSessionRepository, userRepo repositories.UserRepository) WebSessionService {
 	return &webSessionService{
 		repo:     repo,
+		userRepo: userRepo,
 		notifyCh: make(map[string]chan struct{}),
 	}
 }
@@ -92,7 +95,7 @@ func (s *webSessionService) PollSession(sessionID string) (*dto.SessionPollRespo
 	}
 
 	if session.Status == "authorized" {
-		return buildPollResponse(session), nil
+		return s.buildAuthorizedPollResponse(session)
 	}
 
 	s.mu.Lock()
@@ -112,14 +115,14 @@ func (s *webSessionService) PollSession(sessionID string) (*dto.SessionPollRespo
 		if err != nil || session == nil {
 			return nil, ErrSessionNotFound
 		}
-		return buildPollResponse(session), nil
+		return s.buildAuthorizedPollResponse(session)
 
 	case <-timer.C:
 		return nil, nil
 	}
 }
 
-func (s *webSessionService) AuthorizeSession(sessionID string, req *dto.AuthorizeRequest) error {
+func (s *webSessionService) AuthorizeSession(userID uuid.UUID, sessionID string, req *dto.AuthorizeRequest) error {
 	if req.Ciphertext == "" || req.Nonce == "" || req.AndroidX25519Pub == "" {
 		return ErrMissingFields
 	}
@@ -143,7 +146,19 @@ func (s *webSessionService) AuthorizeSession(sessionID string, req *dto.Authoriz
 		return ErrAlreadyAuthorized
 	}
 
-	if err := s.repo.Authorize(id, req.Ciphertext, req.Nonce, req.AndroidX25519Pub); err != nil {
+	webDev := &models.UserDevice{
+		DeviceID:    uuid.New(),
+		UserID:      userID,
+		DeviceModel: "web",
+		LastActive:  time.Now().UTC(),
+	}
+
+	if err := s.userRepo.CreateDevice(webDev); err != nil {
+		logger.Log.Error("failed to create web device", zap.Error(err))
+		return err
+	}
+
+	if err := s.repo.Authorize(id, req.Ciphertext, req.Nonce, req.AndroidX25519Pub, userID, webDev.DeviceID); err != nil {
 		return err
 	}
 
@@ -179,4 +194,36 @@ func buildPollResponse(s *models.WebSession) *dto.SessionPollResponse {
 		Nonce:            s.Nonce,
 		AndroidX25519Pub: s.AndroidX25519Pub,
 	}
+}
+
+func (s *webSessionService) buildAuthorizedPollResponse(session *models.WebSession) (*dto.SessionPollResponse, error) {
+	res := &dto.SessionPollResponse{
+		Ciphertext:       session.Ciphertext,
+		Nonce:            session.Nonce,
+		AndroidX25519Pub: session.AndroidX25519Pub,
+	}
+
+	if session.WebDeviceID == uuid.Nil || session.UserID == uuid.Nil {
+		return res, nil
+	}
+
+	user, err := s.userRepo.GetUserByID(session.UserID)
+	if err != nil || user == nil {
+		logger.Log.Error("poll: user not found for web session", zap.Error(err))
+		return res, nil
+	}
+
+	token, err := jwt.GenerateToken(
+		session.UserID.String(),
+		user.CoreGuardID,
+		session.WebDeviceID.String(),
+	)
+	if err != nil {
+		logger.Log.Error("poll: jwt mint failed", zap.Error(err))
+		return res, nil
+	}
+
+	res.AccessToken = token
+	res.DeviceID = session.WebDeviceID.String()
+	return res, nil
 }

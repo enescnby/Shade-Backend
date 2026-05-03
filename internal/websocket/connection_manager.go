@@ -2,6 +2,7 @@ package websocket
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,13 +27,13 @@ const (
 	pingInterval       = 20 * time.Second
 	pongWait           = 30 * time.Second
 
-	headerSourceConnID = "x-source-conn-id"
+	headerSourceDeviceID = "x-source-device-id"
 )
 
 type ConnectionManager interface {
-	Register(userID string, conn *websocket.Conn) string
-	ReadPump(userID, connID string, conn *websocket.Conn)
-	Unregister(userID, connID string)
+	Register(userID, deviceID string, conn *websocket.Conn) string
+	ReadPump(userID, deviceID, connID string, conn *websocket.Conn)
+	Unregister(userID, deviceID, connID string)
 }
 
 type pendingDelivery struct {
@@ -47,7 +48,8 @@ type connState struct {
 }
 
 type userState struct {
-	userID string
+	userID   string
+	deviceID string
 
 	connsMu sync.RWMutex
 	conns   map[string]*connState
@@ -59,6 +61,10 @@ type userState struct {
 
 	pendingMu   sync.Mutex
 	pendingAcks map[string]*pendingDelivery
+}
+
+func sessionKey(userID, deviceID string) string {
+	return userID + "|" + deviceID
 }
 
 func (us *userState) ack(deliveryTag uint64) error {
@@ -103,8 +109,20 @@ func NewConnectionManager(
 	}
 }
 
-func (m *connectionManager) declareUserQueue(userID string, ch *amqp.Channel) error {
-	queueName := rabbitmq.UserQueueName(userID)
+func (m *connectionManager) userHasAnyOnlineSession(userID string) bool {
+	prefix := userID + "|"
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for k := range m.clients {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *connectionManager) declareUserQueue(userID, deviceID string, ch *amqp.Channel) error {
+	queueName := rabbitmq.UserDeviceQueueName(userID, deviceID)
 	if _, err := ch.QueueDeclare(
 		queueName,
 		true,
@@ -118,26 +136,32 @@ func (m *connectionManager) declareUserQueue(userID string, ch *amqp.Channel) er
 	return ch.QueueBind(queueName, userID, rabbitmq.ExchangeUser, false, nil)
 }
 
-func (m *connectionManager) Register(userID string, conn *websocket.Conn) string {
+func (m *connectionManager) Register(userID, deviceID string, conn *websocket.Conn) string {
 	connID := uuid.NewString()
 	cs := &connState{connID: connID, conn: conn}
 
+	key := sessionKey(userID, deviceID)
+
 	m.mu.Lock()
-	us, ok := m.clients[userID]
+	us, ok := m.clients[key]
 	if !ok {
 		ch, err := m.rabbit.Channel()
 		if err != nil {
 			m.mu.Unlock()
 			logger.Log.Error("user channel open failed",
-				zap.String("user_id", userID), zap.Error(err))
+				zap.String("user_id", userID),
+				zap.String("device_id", deviceID),
+				zap.Error(err))
 			_ = conn.Close()
 			return connID
 		}
 
-		if err := m.declareUserQueue(userID, ch); err != nil {
+		if err := m.declareUserQueue(userID, deviceID, ch); err != nil {
 			m.mu.Unlock()
 			logger.Log.Error("user queue declare failed",
-				zap.String("user_id", userID), zap.Error(err))
+				zap.String("user_id", userID),
+				zap.String("device_id", deviceID),
+				zap.Error(err))
 			_ = ch.Close()
 			_ = conn.Close()
 			return connID
@@ -145,11 +169,12 @@ func (m *connectionManager) Register(userID string, conn *websocket.Conn) string
 
 		us = &userState{
 			userID:      userID,
+			deviceID:    deviceID,
 			conns:       make(map[string]*connState),
 			ch:          ch,
 			pendingAcks: make(map[string]*pendingDelivery),
 		}
-		m.clients[userID] = us
+		m.clients[key] = us
 		m.startUserConsumer(us)
 	}
 
@@ -159,16 +184,17 @@ func (m *connectionManager) Register(userID string, conn *websocket.Conn) string
 	us.connsMu.Unlock()
 	m.mu.Unlock()
 
-	m.setupHeartbeat(userID, cs)
+	m.setupHeartbeat(userID, deviceID, cs)
 
 	logger.Log.Info("user device connected",
 		zap.String("user_id", userID),
+		zap.String("device_id", deviceID),
 		zap.String("conn_id", connID),
 		zap.Int("device_count", deviceCount))
 	return connID
 }
 
-func (m *connectionManager) setupHeartbeat(userID string, cs *connState) {
+func (m *connectionManager) setupHeartbeat(userID, deviceID string, cs *connState) {
 	_ = cs.conn.SetReadDeadline(time.Now().Add(pongWait))
 	cs.conn.SetPongHandler(func(string) error {
 		_ = cs.conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -190,6 +216,7 @@ func (m *connectionManager) setupHeartbeat(userID string, cs *connState) {
 			if err != nil {
 				logger.Log.Info("ping failed, closing",
 					zap.String("user_id", userID),
+					zap.String("device_id", deviceID),
 					zap.String("conn_id", cs.connID),
 					zap.Error(err))
 				_ = cs.conn.Close()
@@ -206,7 +233,7 @@ func (m *connectionManager) startUserConsumer(us *userState) {
 }
 
 func (m *connectionManager) consumeUserQueue(ctx context.Context, us *userState) {
-	queueName := rabbitmq.UserQueueName(us.userID)
+	queueName := rabbitmq.UserDeviceQueueName(us.userID, us.deviceID)
 
 	us.chMu.Lock()
 	ch := us.ch
@@ -257,21 +284,22 @@ func (m *connectionManager) handleDelivery(us *userState, delivery amqp.Delivery
 		return
 	}
 
-	skipConnID := ""
+	skipDeviceID := ""
 	if delivery.Headers != nil {
-		if v, ok := delivery.Headers[headerSourceConnID]; ok {
+		if v, ok := delivery.Headers[headerSourceDeviceID]; ok {
 			if s, ok := v.(string); ok {
-				skipConnID = s
+				skipDeviceID = strings.TrimSpace(s)
 			}
 		}
+	}
+	if skipDeviceID != "" && skipDeviceID == us.deviceID {
+		_ = us.ack(delivery.DeliveryTag)
+		return
 	}
 
 	us.connsMu.RLock()
 	targets := make([]*connState, 0, len(us.conns))
 	for _, cs := range us.conns {
-		if cs.connID == skipConnID {
-			continue
-		}
 		targets = append(targets, cs)
 	}
 	us.connsMu.RUnlock()
@@ -345,7 +373,7 @@ func (m *connectionManager) handleDelivery(us *userState, delivery amqp.Delivery
 		zap.Int("recipients", deliveredTo))
 }
 
-func (m *connectionManager) ReadPump(userID, connID string, conn *websocket.Conn) {
+func (m *connectionManager) ReadPump(userID, deviceID, connID string, conn *websocket.Conn) {
 	for {
 		messageType, rawPayload, err := conn.ReadMessage()
 		if err != nil {
@@ -370,14 +398,14 @@ func (m *connectionManager) ReadPump(userID, connID string, conn *websocket.Conn
 
 		switch msg := wrapper.Content.(type) {
 		case *pb.WebSocketMessage_Payload:
-			m.handlePayload(userID, connID, msg.Payload, rawPayload)
+			m.handlePayload(userID, deviceID, msg.Payload, rawPayload)
 		case *pb.WebSocketMessage_Receipt:
-			m.handleReceipt(userID, connID, msg.Receipt, rawPayload)
+			m.handleReceipt(userID, deviceID, msg.Receipt, rawPayload)
 		}
 	}
 }
 
-func (m *connectionManager) handlePayload(senderID, senderConnID string, payload *pb.EncryptedPayload, rawPayload []byte) {
+func (m *connectionManager) handlePayload(senderID, senderDeviceID string, payload *pb.EncryptedPayload, rawPayload []byte) {
 	receiverID := payload.ReceiverId
 
 	ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
@@ -385,23 +413,26 @@ func (m *connectionManager) handlePayload(senderID, senderConnID string, payload
 	cancel()
 
 	echoCtx, echoCancel := context.WithTimeout(context.Background(), userPublishTimeout)
-	if echoErr := m.publishToUser(echoCtx, senderID, rawPayload, senderConnID); echoErr != nil {
+	if echoErr := m.publishToUser(echoCtx, senderID, rawPayload, senderDeviceID); echoErr != nil {
 		logger.Log.Warn("multi-device echo publish failed",
 			zap.String("user_id", senderID), zap.Error(echoErr))
 	}
 	echoCancel()
 
-	m.mu.RLock()
-	_, isOnline := m.clients[receiverID]
-	m.mu.RUnlock()
-
-	if !isOnline {
-		receiverUUID, _ := uuid.Parse(receiverID)
-		if device, deviceErr := m.userRepo.GetDeviceByUserID(receiverUUID); deviceErr == nil && device.FCMToken != "" {
-			_ = m.fcmService.SendWakeUpSignal(device.FCMToken)
-		} else {
-			logger.Log.Warn("FCM Token not found, WakeUp signal skipped",
-				zap.String("user_id", receiverID))
+	if !m.userHasAnyOnlineSession(receiverID) {
+		receiverUUID, err := uuid.Parse(receiverID)
+		if err == nil {
+			devices, err := m.userRepo.ListDevicesByUserID(receiverUUID)
+			if err != nil {
+				logger.Log.Warn("list devices for FCM failed",
+					zap.String("user_id", receiverID), zap.Error(err))
+			} else {
+				for _, d := range devices {
+					if d.FCMToken != "" {
+						_ = m.fcmService.SendWakeUpSignal(d.FCMToken)
+					}
+				}
+			}
 		}
 	}
 
@@ -427,13 +458,13 @@ func (m *connectionManager) handlePayload(senderID, senderConnID string, payload
 	}
 }
 
-func (m *connectionManager) handleReceipt(senderID, senderConnID string, receipt *pb.DeliveryReceipt, rawPayload []byte) {
+func (m *connectionManager) handleReceipt(senderID, senderDeviceID string, receipt *pb.DeliveryReceipt, rawPayload []byte) {
 	if receipt.Status == pb.ReceiptStatus_DELIVERED {
 		msgUUID, _ := uuid.Parse(receipt.MessageId)
 		_ = m.msgRepo.MarkAsDelivered([]uuid.UUID{msgUUID})
 
 		m.mu.RLock()
-		us, ok := m.clients[senderID]
+		us, ok := m.clients[sessionKey(senderID, senderDeviceID)]
 		m.mu.RUnlock()
 
 		if ok {
@@ -467,7 +498,7 @@ func (m *connectionManager) handleReceipt(senderID, senderConnID string, receipt
 	cancel()
 
 	echoCtx, echoCancel := context.WithTimeout(context.Background(), userPublishTimeout)
-	if err := m.publishToUser(echoCtx, senderID, rawPayload, senderConnID); err != nil {
+	if err := m.publishToUser(echoCtx, senderID, rawPayload, senderDeviceID); err != nil {
 		logger.Log.Warn("multi-device receipt echo failed",
 			zap.String("user_id", senderID), zap.Error(err))
 	}
@@ -483,7 +514,7 @@ func (m *connectionManager) publishToUser(ctx context.Context, receiverID string
 
 	var headers amqp.Table
 	if sourceConnID != "" {
-		headers = amqp.Table{headerSourceConnID: sourceConnID}
+		headers = amqp.Table{headerSourceDeviceID: sourceConnID}
 	}
 
 	return ch.PublishWithContext(ctx,
@@ -501,9 +532,11 @@ func (m *connectionManager) publishToUser(ctx context.Context, receiverID string
 	)
 }
 
-func (m *connectionManager) Unregister(userID, connID string) {
+func (m *connectionManager) Unregister(userID, deviceID, connID string) {
+	key := sessionKey(userID, deviceID)
+
 	m.mu.Lock()
-	us, exists := m.clients[userID]
+	us, exists := m.clients[key]
 	if !exists {
 		m.mu.Unlock()
 		return
@@ -519,7 +552,7 @@ func (m *connectionManager) Unregister(userID, connID string) {
 
 	lastConn := remaining == 0
 	if lastConn {
-		delete(m.clients, userID)
+		delete(m.clients, key)
 	}
 	m.mu.Unlock()
 
@@ -531,6 +564,7 @@ func (m *connectionManager) Unregister(userID, connID string) {
 		m.cleanupUserState(us)
 		logger.Log.Info("user fully disconnected, cleaned from RAM",
 			zap.String("user_id", userID),
+			zap.String("device_id", deviceID),
 			zap.String("conn_id", connID))
 		return
 	}
@@ -538,6 +572,7 @@ func (m *connectionManager) Unregister(userID, connID string) {
 	logger.Log.Info("user device disconnected, others still online",
 		zap.String("user_id", userID),
 		zap.String("conn_id", connID),
+		zap.String("device_id", deviceID),
 		zap.Int("remaining_devices", remaining))
 }
 

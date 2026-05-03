@@ -17,4 +17,6 @@ type SessionPollResponse struct {
 	Ciphertext       string `json:"ciphertext"`
 	Nonce            string `json:"nonce"`
 	AndroidX25519Pub string `json:"android_x25519_pub"`
+	AccessToken      string `json:"access_token,omitempty"`
+	DeviceID         string `json:"device_id"`
 }

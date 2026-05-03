@@ -36,7 +36,7 @@ func (h *SyncHandler) UpgradeAndServe(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing token"})
 	}
 
-	userID, _, err := jwtpkg.ParseToken(token)
+	userID, _, _, err := jwtpkg.ParseToken(token)
 	if err != nil || strings.TrimSpace(userID) == "" {
 		logger.Log.Warn("sync upgrade: invalid token", zap.String("session_id", c.Params("session_id")), zap.Error(err))
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
