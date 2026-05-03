@@ -22,7 +22,7 @@ func Protected() fiber.Handler {
 
 		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 
-		userID, coreGuardID, err := jwt.ParseToken(tokenString)
+		userID, coreGuardID, deviceID, err := jwt.ParseToken(tokenString)
 		if err != nil {
 			logger.Log.Warn("unauthorized access attempt: invalid token", zap.Error(err), zap.String("ip", ctx.IP()))
 			return ctx.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
@@ -32,6 +32,7 @@ func Protected() fiber.Handler {
 
 		ctx.Locals("user_id", userID)
 		ctx.Locals("core_guard_id", coreGuardID)
+		ctx.Locals("device_id", deviceID)
 
 		return ctx.Next()
 	}

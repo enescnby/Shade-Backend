@@ -28,7 +28,7 @@ type UserKey struct {
 }
 
 type UserDevice struct {
-	DeviceID    int       `gorm:"primaryKey;autoIncrement"`
+	DeviceID    uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
 	UserID      uuid.UUID `gorm:"type:uuid;index;not null"`
 	FCMToken    string    `gorm:"type:varchar"`
 	DeviceModel string    `gorm:"type:varchar"`

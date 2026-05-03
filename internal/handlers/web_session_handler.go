@@ -5,8 +5,10 @@ import (
 	"core-backend/internal/services"
 	"core-backend/pkg/logger"
 	"errors"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -59,7 +61,16 @@ func (h *WebSessionHandler) AuthorizeSession(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnprocessableEntity).JSON(fiber.Map{"error": "invalid JSON format"})
 	}
 
-	err := h.service.AuthorizeSession(sessionID, &req)
+	userIDStr, ok := c.Locals("user_id").(string)
+	if !ok || strings.TrimSpace(userIDStr) == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	userID, err := uuid.Parse(strings.TrimSpace(userIDStr))
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+
+	err = h.service.AuthorizeSession(userID, sessionID, &req)
 	if err != nil {
 		switch {
 		case errors.Is(err, services.ErrSessionNotFound):

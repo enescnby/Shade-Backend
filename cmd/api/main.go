@@ -43,7 +43,7 @@ func main() {
 	app := fiber.New()
 
 	app.Use(cors.New(cors.Config{
-		AllowOrigins:     "http://localhost:5173",
+		AllowOrigins:     "http://localhost:5173, https://web.shadeapp.tech",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
 		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
 		AllowCredentials: true,
@@ -66,7 +66,7 @@ func main() {
 	userService := services.NewUserService(userRepo)
 	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
 	messageService := services.NewMessageService(rabbitClient)
-	webSessionService := services.NewSessionService(webSessionRepo)
+	webSessionService := services.NewSessionService(webSessionRepo, userRepo)
 
 	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService, rabbitClient)
 	wsHandler := handlers.NewWebSocketHandler(cm)
@@ -91,7 +91,7 @@ func main() {
 	webAuth := auth.Group("/web")
 	webAuth.Post("/session", webSessionHandler.CreateSession)
 	webAuth.Get("/session/:session_id", webSessionHandler.PollSession)
-	webAuth.Post("/session/:session_id/authorize", webSessionHandler.AuthorizeSession)
+	webAuth.Post("/session/:session_id/authorize", middleware.Protected(), webSessionHandler.AuthorizeSession)
 
 	keys := v1.Group("/keys", middleware.Protected())
 	keys.Get("/:id", keyHandler.GetPublicKey)

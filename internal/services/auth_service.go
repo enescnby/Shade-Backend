@@ -12,8 +12,11 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 )
 
 type AuthService interface {
@@ -60,6 +63,12 @@ func (s *authService) Register(req *dto.RegisterRequest) (*dto.RegisterResponse,
 		return nil, err
 	}
 
+	dev, err := s.userRepo.GetDeviceByUserID(newUser.UserID)
+	if err != nil {
+		logger.Log.Error("registration succeeded but device row not found", zap.Error(err))
+		return nil, errors.New("could not load device after registration")
+	}
+
 	auditLog := &models.SecurityAuditLog{
 		UserID:     newUser.UserID,
 		ActionType: "USER_REGISTERED",
@@ -73,6 +82,7 @@ func (s *authService) Register(req *dto.RegisterRequest) (*dto.RegisterResponse,
 	return &dto.RegisterResponse{
 		CoreGuardID: coreGuardID,
 		UserID:      newUser.UserID.String(),
+		DeviceID:    dev.DeviceID.String(),
 		Message:     "Account created successfully. Keep your CoreGuard ID and PIN safe",
 	}, nil
 }
@@ -91,10 +101,10 @@ func (s *authService) LoginInit(req *dto.LoginInitRequest) (*dto.LoginInitRespon
 	logger.Log.Info("challenge generated for user", zap.String("core_guard_id", req.CoreGuardID))
 
 	return &dto.LoginInitResponse{
-		EncryptedIdentityPrivateKey: user.Key.EncryptedIdentityPrivateKey,
+		EncryptedIdentityPrivateKey:   user.Key.EncryptedIdentityPrivateKey,
 		EncryptedEncryptionPrivateKey: user.Key.EncryptedEncryptionPrivateKey,
-		Salt:                        user.Key.Salt,
-		Challenge:                   challenge,
+		Salt:                          user.Key.Salt,
+		Challenge:                     challenge,
 	}, nil
 }
 
@@ -132,16 +142,47 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 		return nil, errors.New("invalid cryptographic signature")
 	}
 
-	newDevice := &models.UserDevice{
-		UserID:      user.UserID,
-		DeviceModel: req.DeviceModel,
-		FCMToken:    req.FCMToken,
-	}
-	if err := s.userRepo.UpdateDevice(user.UserID, newDevice); err != nil {
-		return nil, errors.New("failed to update device information")
-	}
+	var boundDevice *models.UserDevice
+	deviceIDStr := strings.TrimSpace(req.DeviceID)
 
-	tokenString, err := jwt.GenerateToken(user.UserID.String(), user.CoreGuardID)
+	if deviceIDStr != "" {
+		deviceUUID, parseErr := uuid.Parse(deviceIDStr)
+		if parseErr != nil {
+			return nil, errors.New("invalid device_id")
+		}
+
+		dev, getErr := s.userRepo.GetDeviceByUserAndID(user.UserID, deviceUUID)
+		if getErr != nil {
+			if errors.Is(getErr, gorm.ErrRecordNotFound) {
+				return nil, errors.New("unknown device")
+			}
+			return nil, errors.New("failed to load device")
+		}
+
+		dev.FCMToken = req.FCMToken
+		dev.DeviceModel = req.DeviceModel
+		dev.LastActive = time.Now().UTC()
+
+		if updErr := s.userRepo.UpdateDeviceFields(dev); updErr != nil {
+			logger.Log.Error("failed to update device on login", zap.Error(updErr))
+			return nil, errors.New("failed to update device")
+		}
+		boundDevice = dev
+	} else {
+		dev := &models.UserDevice{
+			DeviceID:    uuid.New(),
+			UserID:      user.UserID,
+			FCMToken:    req.FCMToken,
+			DeviceModel: req.DeviceModel,
+			LastActive:  time.Now().UTC(),
+		}
+		if crtErr := s.userRepo.CreateDevice(dev); crtErr != nil {
+			logger.Log.Error("failed to create device on login", zap.Error(crtErr))
+			return nil, errors.New("failed to register device")
+		}
+		boundDevice = dev
+	}
+	tokenString, err := jwt.GenerateToken(user.UserID.String(), user.CoreGuardID, boundDevice.DeviceID.String())
 	if err != nil {
 		logger.Log.Error("failed to generate JWT token", zap.Error(err))
 		return nil, errors.New("internal server error during token generation")
@@ -159,6 +200,7 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 		AccessToken: tokenString,
 		CoreGuardID: user.CoreGuardID,
 		UserID:      user.UserID.String(),
+		DeviceID:    boundDevice.DeviceID.String(),
 		Message:     "Welcome back! Cryptographic verification successful.",
 	}, nil
 }

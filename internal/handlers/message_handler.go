@@ -21,7 +21,11 @@ func NewMessageHandler(msgSvc services.MessageService) *MessageHandler {
 func (h *MessageHandler) GetInbox(c *fiber.Ctx) error {
 	userID, _ := c.Locals("user_id").(string)
 	userID = strings.TrimSpace(userID)
-	if userID == "" {
+
+	deviceID, _ := c.Locals("device_id").(string)
+	deviceID = strings.TrimSpace(deviceID)
+
+	if userID == "" || deviceID == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
 	}
 
@@ -32,7 +36,7 @@ func (h *MessageHandler) GetInbox(c *fiber.Ctx) error {
 		}
 	}
 
-	response, err := h.msgSvc.DrainInbox(userID, limit)
+	response, err := h.msgSvc.DrainInbox(userID, deviceID, limit)
 	if err != nil {
 		logger.Log.Error("inbox drain failed",
 			zap.String("user_id", userID), zap.Error(err))

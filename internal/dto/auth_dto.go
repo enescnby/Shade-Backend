@@ -14,6 +14,7 @@ type RegisterResponse struct {
 	CoreGuardID string `json:"core_guard_id"`
 	UserID      string `json:"user_id"`
 	Message     string `json:"message"`
+	DeviceID    string `json:"device_id"`
 }
 
 type LoginInitRequest struct {
@@ -21,10 +22,10 @@ type LoginInitRequest struct {
 }
 
 type LoginInitResponse struct {
-	EncryptedIdentityPrivateKey string `json:"encrypted_identity_private_key"`
+	EncryptedIdentityPrivateKey   string `json:"encrypted_identity_private_key"`
 	EncryptedEncryptionPrivateKey string `json:"encrypted_encryption_private_key"`
-	Salt                        string `json:"salt"`
-	Challenge                   string `json:"challenge"`
+	Salt                          string `json:"salt"`
+	Challenge                     string `json:"challenge"`
 }
 
 type LoginVerifyRequest struct {
@@ -32,12 +33,14 @@ type LoginVerifyRequest struct {
 	Challenge   string `json:"challenge"`
 	Signature   string `json:"signature"`
 	DeviceModel string `json:"device_model"`
+	DeviceID    string `json:"device_id,omitempty"`
 	FCMToken    string `json:"fcm_token"`
 }
 
 type LoginVerifyResponse struct {
 	CoreGuardID string `json:"core_guard_id"`
 	UserID      string `json:"user_id"`
+	DeviceID    string `json:"device_id"`
 	AccessToken string `json:"access_token"`
 	Message     string `json:"message"`
 }

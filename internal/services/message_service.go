@@ -20,7 +20,7 @@ const (
 )
 
 type MessageService interface {
-	DrainInbox(userID string, limit int) (*dto.InboxResponse, error)
+	DrainInbox(userID, deviceID string, limit int) (*dto.InboxResponse, error)
 }
 
 type messageService struct {
@@ -31,7 +31,7 @@ func NewMessageService(rabbit *rabbitmq.Client) MessageService {
 	return &messageService{rabbit: rabbit}
 }
 
-func (s *messageService) DrainInbox(userID string, limit int) (*dto.InboxResponse, error) {
+func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.InboxResponse, error) {
 	if limit <= 0 {
 		limit = defaultDrainLimit
 	}
@@ -45,7 +45,7 @@ func (s *messageService) DrainInbox(userID string, limit int) (*dto.InboxRespons
 	}
 	defer ch.Close()
 
-	queueName := rabbitmq.UserQueueName(userID)
+	queueName := rabbitmq.UserDeviceQueueName(userID, deviceID)
 	response := &dto.InboxResponse{
 		Messages: []dto.InboxMessage{},
 		Receipts: []dto.InboxReceipt{},

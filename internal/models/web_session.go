@@ -8,6 +8,8 @@ import (
 
 type WebSession struct {
 	SessionID        uuid.UUID `gorm:"type:uuid;primaryKey"`
+	UserID           uuid.UUID `gorm:"type:uuid"`
+	WebDeviceID      uuid.UUID `gorm:"type:uuid"`
 	Status           string    `gorm:"type:varchar(16);not null;default:'pending'"`
 	Ciphertext       string    `gorm:"type:text"`
 	Nonce            string    `gorm:"type:varchar(64)"`

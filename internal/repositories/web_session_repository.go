@@ -14,7 +14,7 @@ import (
 type WebSessionRepository interface {
 	Create(session *models.WebSession) error
 	GetByID(id uuid.UUID) (*models.WebSession, error)
-	Authorize(id uuid.UUID, ciphertext, nonce, androidPub string) error
+	Authorize(id uuid.UUID, ciphertext, nonce, androidPub string, userID, webDeviceID uuid.UUID) error
 	DeleteExpired() error
 }
 
@@ -47,7 +47,7 @@ func (r *webSessionRepository) GetByID(id uuid.UUID) (*models.WebSession, error)
 	return &session, nil
 }
 
-func (r *webSessionRepository) Authorize(id uuid.UUID, ciphertext, nonce, androidPub string) error {
+func (r *webSessionRepository) Authorize(id uuid.UUID, ciphertext, nonce, androidPub string, userID, webDeviceID uuid.UUID) error {
 	now := time.Now()
 	result := r.db.Model(&models.WebSession{}).
 		Where("session_id = ? AND status = ?", id, "pending").
@@ -57,6 +57,8 @@ func (r *webSessionRepository) Authorize(id uuid.UUID, ciphertext, nonce, androi
 			"nonce":              nonce,
 			"android_x25519_pub": androidPub,
 			"authorized_at":      &now,
+			"user_id":            userID,
+			"web_device_id":      webDeviceID,
 		})
 	if result.Error != nil {
 		logger.Log.Error("failed to authorize web session", zap.Error(result.Error))

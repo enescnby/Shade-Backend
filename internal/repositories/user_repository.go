@@ -16,8 +16,11 @@ type UserRepository interface {
 	GetUserByID(userID uuid.UUID) (*models.User, error)
 	GetDeviceByUserID(userID uuid.UUID) (*models.UserDevice, error)
 	GetUserByCoreGuardID(coreGuardID string) (*models.User, error)
-	UpdateDevice(userID uuid.UUID, newDevice *models.UserDevice) error
 	GetUserForLookup(ctx context.Context, coreGuardID string) (*models.User, error)
+	CreateDevice(userDevice *models.UserDevice) error
+	GetDeviceByUserAndID(userID, deviceID uuid.UUID) (*models.UserDevice, error)
+	UpdateDeviceFields(device *models.UserDevice) error
+	ListDevicesByUserID(userID uuid.UUID) ([]models.UserDevice, error)
 }
 
 type userRepository struct {
@@ -76,21 +79,6 @@ func (r *userRepository) GetDeviceByUserID(userID uuid.UUID) (*models.UserDevice
 	return &device, nil
 }
 
-func (r *userRepository) UpdateDevice(userID uuid.UUID, newDevice *models.UserDevice) error {
-	err := r.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Where("user_id = ?", userID).Delete(&models.UserDevice{}).Error; err != nil {
-			return err
-		}
-		return tx.Create(newDevice).Error
-	})
-
-	if err != nil {
-		logger.Log.Error("failed to update user device", zap.Error(err))
-		return err
-	}
-	return nil
-}
-
 func (r *userRepository) GetUserForLookup(ctx context.Context, coreGuardID string) (*models.User, error) {
 	var user models.User
 
@@ -109,4 +97,52 @@ func (r *userRepository) GetUserForLookup(ctx context.Context, coreGuardID strin
 	}
 
 	return &user, err
+}
+
+func (r *userRepository) CreateDevice(userDevice *models.UserDevice) error {
+	if err := r.db.Create(userDevice).Error; err != nil {
+		logger.Log.Error("failed to create device", zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+func (r *userRepository) GetDeviceByUserAndID(userID, deviceID uuid.UUID) (*models.UserDevice, error) {
+	var device models.UserDevice
+	err := r.db.Where("user_id = ? AND device_id = ?", userID, deviceID).First(&device).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, err
+		}
+		logger.Log.Error("failed to get device by user and id", zap.Error(err))
+		return nil, err
+	}
+	return &device, nil
+}
+
+func (r *userRepository) UpdateDeviceFields(device *models.UserDevice) error {
+	res := r.db.Model(&models.UserDevice{}).
+		Where("device_id = ? AND user_id = ?", device.DeviceID, device.UserID).
+		Updates(map[string]interface{}{
+			"fcm_token":    device.FCMToken,
+			"device_model": device.DeviceModel,
+			"last_active":  device.LastActive,
+		})
+	if res.Error != nil {
+		logger.Log.Error("failed to update device fields", zap.Error(res.Error))
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func (r *userRepository) ListDevicesByUserID(userID uuid.UUID) ([]models.UserDevice, error) {
+	var devices []models.UserDevice
+	if err := r.db.Where("user_id = ?", userID).Order("device_id ASC").Find(&devices).Error; err != nil {
+		logger.Log.Error("failed to list devices by user", zap.Error(err))
+		return nil, err
+	}
+	return devices, nil
 }
