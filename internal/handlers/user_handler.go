@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
 
@@ -31,6 +32,29 @@ func (h *UserHandler) GetUserForLookup(c *fiber.Ctx) error {
 	}
 
 	return c.Status(fiber.StatusOK).JSON(res)
+}
+
+func (h *UserHandler) UpdateFCMToken(c *fiber.Ctx) error {
+	userIDStr, ok := c.Locals("user_id").(string)
+	if !ok {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id"})
+	}
+
+	var body struct {
+		FCMToken string `json:"fcm_token"`
+	}
+	if err := c.BodyParser(&body); err != nil || body.FCMToken == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "fcm_token required"})
+	}
+
+	if err := h.userService.UpdateFCMToken(c.UserContext(), userID, body.FCMToken); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to update fcm token"})
+	}
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true})
 }
 
 func (h *UserHandler) GetUserStatus(c *fiber.Ctx) error {

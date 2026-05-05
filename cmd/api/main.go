@@ -102,6 +102,7 @@ func main() {
 	user := v1.Group("/user", middleware.Protected())
 	user.Get("/lookup/:shadeId", userHandler.GetUserForLookup)
 	user.Get("/status/:shadeId", userHandler.GetUserStatus)
+	user.Patch("/fcm-token", userHandler.UpdateFCMToken)
 
 	audit := v1.Group("/audit", middleware.Protected())
 	audit.Get("/me", auditHandler.GetMyLogs)

@@ -5,11 +5,14 @@ import (
 	"core-backend/internal/dto"
 	"core-backend/internal/repositories"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type UserService interface {
 	GetUserForLookup(ctx context.Context, coreGuardID string) (*dto.LookupResponse, error)
 	GetUserStatus(ctx context.Context, coreGuardID string) (*dto.UserStatusResponse, error)
+	UpdateFCMToken(ctx context.Context, userID uuid.UUID, token string) error
 }
 
 type userService struct {
@@ -31,6 +34,15 @@ func (s *userService) GetUserForLookup(ctx context.Context, coreGuardID string) 
 		ShadeID:             user.CoreGuardID,
 		EncryptionPublicKey: user.Key.EncryptionPublicKey,
 	}, err
+}
+
+func (s *userService) UpdateFCMToken(ctx context.Context, userID uuid.UUID, token string) error {
+	device, err := s.repo.GetDeviceByUserID(userID)
+	if err != nil {
+		return err
+	}
+	device.FCMToken = token
+	return s.repo.UpdateDevice(userID, device)
 }
 
 func (s *userService) GetUserStatus(ctx context.Context, coreGuardID string) (*dto.UserStatusResponse, error) {
