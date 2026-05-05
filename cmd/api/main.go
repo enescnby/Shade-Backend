@@ -62,6 +62,7 @@ func main() {
 	msgRepo := repositories.NewMessageRepository(database.DB)
 	mediaRepo := repositories.NewMediaRepository(database.DB, r2Client, config.AppConfig.R2BucketName)
 	webSessionRepo := repositories.NewWebSessionRepository(database.DB)
+	groupRepo := repositories.NewGroupRepository(database.DB)
 
 	authService := services.NewAuthService(userRepo, auditRepo)
 	keyService := services.NewKeyService(keyRepo)
@@ -69,6 +70,7 @@ func main() {
 	mediaService := services.NewMediaService(mediaRepo, 50*1024*1024) // 50 MB
 	messageService := services.NewMessageService(rabbitClient)
 	webSessionService := services.NewSessionService(webSessionRepo)
+	groupService := services.NewGroupService(groupRepo, userRepo)
 
 	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService, rabbitClient)
 	wsHandler := handlers.NewWebSocketHandler(cm)
@@ -82,6 +84,7 @@ func main() {
 	messageHandler := handlers.NewMessageHandler(messageService)
 	webSessionHandler := handlers.NewWebSessionHandler(webSessionService)
 	syncHandler := handlers.NewSyncHandler(syncManager, webSessionService)
+	groupHandler := handlers.NewGroupHandler(groupService)
 
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
@@ -113,6 +116,18 @@ func main() {
 
 	messages := v1.Group("/messages", middleware.Protected())
 	messages.Get("/inbox", messageHandler.GetInbox)
+
+	groups := v1.Group("/groups", middleware.Protected())
+	groups.Post("/", groupHandler.CreateGroup)
+	groups.Get("/", groupHandler.ListGroups)
+	groups.Get("/:id", groupHandler.GetGroup)
+	groups.Delete("/:id", groupHandler.DeleteGroup)
+	groups.Post("/:id/members", groupHandler.AddMember)
+	groups.Delete("/:id/members/:userId", groupHandler.RemoveMember)
+
+	invites := v1.Group("/invites", middleware.Protected())
+	invites.Post("/", groupHandler.CreateInvite)
+	invites.Get("/:code", groupHandler.RedeemInvite)
 
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
 	v1.Get("/ws/sync/:session_id", syncHandler.UpgradeAndServe)
