@@ -40,13 +40,15 @@ func main() {
 		log.Fatalf("failed to declare rabbitmq topology: %v", err)
 	}
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		BodyLimit: 50 * 1024 * 1024, // 50 MB — ses ve dosya paylaşımı için
+	})
 
 	app.Use(cors.New(cors.Config{
-		AllowOrigins:     "http://localhost:5173",
+		AllowOrigins:     "*",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
 		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-		AllowCredentials: true,
+		AllowCredentials: false,
 	}))
 
 	firebaseApp := firebase.InitFirebase()
@@ -64,7 +66,7 @@ func main() {
 	authService := services.NewAuthService(userRepo, auditRepo)
 	keyService := services.NewKeyService(keyRepo)
 	userService := services.NewUserService(userRepo)
-	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
+	mediaService := services.NewMediaService(mediaRepo, 50*1024*1024) // 50 MB
 	messageService := services.NewMessageService(rabbitClient)
 	webSessionService := services.NewSessionService(webSessionRepo)
 
