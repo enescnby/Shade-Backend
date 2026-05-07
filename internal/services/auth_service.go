@@ -4,7 +4,7 @@ import (
 	"core-backend/internal/dto"
 	"core-backend/internal/models"
 	"core-backend/internal/repositories"
-	"core-backend/pkg/jwt"
+	pkgjwt "core-backend/pkg/jwt"
 	"core-backend/pkg/logger"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -21,18 +21,25 @@ type AuthService interface {
 	Register(req *dto.RegisterRequest) (*dto.RegisterResponse, error)
 	LoginInit(req *dto.LoginInitRequest) (*dto.LoginInitResponse, error)
 	LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerifyResponse, error)
+	Refresh(req *dto.RefreshRequest) (*dto.RefreshResponse, error)
 }
 
 type authService struct {
-	userRepo       repositories.UserRepository
-	auditRepo      repositories.AuditRepository
-	challengeCache sync.Map
+	userRepo        repositories.UserRepository
+	auditRepo       repositories.AuditRepository
+	refreshTokenRepo repositories.RefreshTokenRepository
+	challengeCache  sync.Map
 }
 
-func NewAuthService(userRepo repositories.UserRepository, auditRepo repositories.AuditRepository) AuthService {
+func NewAuthService(
+	userRepo repositories.UserRepository,
+	auditRepo repositories.AuditRepository,
+	refreshTokenRepo repositories.RefreshTokenRepository,
+) AuthService {
 	return &authService{
-		userRepo:  userRepo,
-		auditRepo: auditRepo,
+		userRepo:        userRepo,
+		auditRepo:       auditRepo,
+		refreshTokenRepo: refreshTokenRepo,
 	}
 }
 
@@ -143,11 +150,29 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 		return nil, errors.New("failed to update device information")
 	}
 
-	tokenString, err := jwt.GenerateToken(user.UserID.String(), user.CoreGuardID)
+	accessToken, err := pkgjwt.GenerateAccessToken(user.UserID.String(), user.CoreGuardID)
 	if err != nil {
-		logger.Log.Error("failed to generate JWT token", zap.Error(err))
+		logger.Log.Error("failed to generate access token", zap.Error(err))
 		return nil, errors.New("internal server error during token generation")
 	}
+
+	rawRefresh, refreshHash, err := pkgjwt.GenerateOpaqueRefreshToken()
+	if err != nil {
+		logger.Log.Error("failed to generate refresh token", zap.Error(err))
+		return nil, errors.New("internal server error during token generation")
+	}
+
+	device, _ := s.userRepo.GetDeviceByUserID(user.UserID)
+	deviceID := 0
+	if device != nil {
+		deviceID = device.DeviceID
+	}
+	_ = s.refreshTokenRepo.Save(&models.RefreshToken{
+		UserID:    user.UserID,
+		TokenHash: refreshHash,
+		DeviceID:  deviceID,
+		ExpiresAt: time.Now().Add(pkgjwt.RefreshTokenTTL),
+	})
 
 	_ = s.auditRepo.LogEvent(&models.SecurityAuditLog{
 		UserID:     user.UserID,
@@ -155,13 +180,60 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 		IPAddress:  "system",
 	})
 
-	logger.Log.Info("login verified successfully, JWT issued", zap.String("core_guard_id", req.CoreGuardID))
+	logger.Log.Info("login verified successfully, tokens issued", zap.String("core_guard_id", req.CoreGuardID))
 
 	return &dto.LoginVerifyResponse{
-		AccessToken: tokenString,
-		CoreGuardID: user.CoreGuardID,
+		AccessToken:  accessToken,
+		RefreshToken: rawRefresh,
+		CoreGuardID:  user.CoreGuardID,
 		UserID:      user.UserID.String(),
 		Message:     "Welcome back! Cryptographic verification successful.",
+	}, nil
+}
+
+func (s *authService) Refresh(req *dto.RefreshRequest) (*dto.RefreshResponse, error) {
+	if req.RefreshToken == "" {
+		return nil, errors.New("refresh_token is required")
+	}
+
+	hash, err := pkgjwt.HashRefreshToken(req.RefreshToken)
+	if err != nil {
+		return nil, errors.New("invalid refresh token")
+	}
+
+	rt, err := s.refreshTokenRepo.FindByHash(hash)
+	if err != nil {
+		return nil, err // "refresh token not found" or "refresh token expired"
+	}
+
+	user, err := s.userRepo.GetUserByID(rt.UserID)
+	if err != nil {
+		return nil, errors.New("user not found")
+	}
+
+	// Rotate: delete old token, issue new pair
+	_ = s.refreshTokenRepo.Delete(rt.ID)
+
+	newAccess, err := pkgjwt.GenerateAccessToken(user.UserID.String(), user.CoreGuardID)
+	if err != nil {
+		return nil, errors.New("failed to generate access token")
+	}
+
+	newRawRefresh, newHash, err := pkgjwt.GenerateOpaqueRefreshToken()
+	if err != nil {
+		return nil, errors.New("failed to generate refresh token")
+	}
+
+	_ = s.refreshTokenRepo.Save(&models.RefreshToken{
+		UserID:    user.UserID,
+		TokenHash: newHash,
+		DeviceID:  rt.DeviceID,
+		ExpiresAt: time.Now().Add(pkgjwt.RefreshTokenTTL),
+	})
+
+	return &dto.RefreshResponse{
+		AccessToken:  newAccess,
+		RefreshToken: newRawRefresh,
 	}, nil
 }
 

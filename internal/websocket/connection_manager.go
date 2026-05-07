@@ -135,6 +135,11 @@ func (m *connectionManager) Register(userID string, conn *websocket.Conn) {
 	m.clients[userID] = state
 	m.mu.Unlock()
 
+	// Bağlanınca LastActive'i hemen güncelle
+	if uid, err := uuid.Parse(userID); err == nil {
+		go func() { _ = m.userRepo.UpdateLastActive(uid) }()
+	}
+
 	m.setupHeartbeat(userID, state)
 	m.startUserConsumer(userID, state)
 
@@ -145,6 +150,10 @@ func (m *connectionManager) setupHeartbeat(userID string, state *clientState) {
 	_ = state.conn.SetReadDeadline(time.Now().Add(pongWait))
 	state.conn.SetPongHandler(func(string) error {
 		_ = state.conn.SetReadDeadline(time.Now().Add(pongWait))
+		// Her pong'da LastActive'i güncelle (20 saniyede bir)
+		if uid, err := uuid.Parse(userID); err == nil {
+			go func() { _ = m.userRepo.UpdateLastActive(uid) }()
+		}
 		return nil
 	})
 

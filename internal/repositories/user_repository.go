@@ -5,6 +5,7 @@ import (
 	"core-backend/internal/models"
 	"core-backend/pkg/logger"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -19,6 +20,8 @@ type UserRepository interface {
 	UpdateDevice(userID uuid.UUID, newDevice *models.UserDevice) error
 	GetUserForLookup(ctx context.Context, coreGuardID string) (*models.User, error)
 	GetUserWithDeviceByShadeID(ctx context.Context, coreGuardID string) (*models.User, error)
+	UpdateDisplayName(ctx context.Context, userID uuid.UUID, displayName string) error
+	UpdateLastActive(userID uuid.UUID) error
 }
 
 type userRepository struct {
@@ -110,6 +113,19 @@ func (r *userRepository) GetUserForLookup(ctx context.Context, coreGuardID strin
 	}
 
 	return &user, err
+}
+
+func (r *userRepository) UpdateLastActive(userID uuid.UUID) error {
+	return r.db.Model(&models.UserDevice{}).
+		Where("user_id = ?", userID).
+		Update("last_active", time.Now()).Error
+}
+
+func (r *userRepository) UpdateDisplayName(ctx context.Context, userID uuid.UUID, displayName string) error {
+	return r.db.WithContext(ctx).
+		Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("display_name", displayName).Error
 }
 
 func (r *userRepository) GetUserWithDeviceByShadeID(ctx context.Context, coreGuardID string) (*models.User, error) {

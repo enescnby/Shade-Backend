@@ -59,12 +59,13 @@ func main() {
 	keyRepo := repositories.NewKeyRepository(database.DB)
 	userRepo := repositories.NewUserRepository(database.DB)
 	auditRepo := repositories.NewAuditRepository(database.DB)
+	refreshTokenRepo := repositories.NewRefreshTokenRepository(database.DB)
 	msgRepo := repositories.NewMessageRepository(database.DB)
 	mediaRepo := repositories.NewMediaRepository(database.DB, r2Client, config.AppConfig.R2BucketName)
 	webSessionRepo := repositories.NewWebSessionRepository(database.DB)
 	groupRepo := repositories.NewGroupRepository(database.DB)
 
-	authService := services.NewAuthService(userRepo, auditRepo)
+	authService := services.NewAuthService(userRepo, auditRepo, refreshTokenRepo)
 	keyService := services.NewKeyService(keyRepo)
 	userService := services.NewUserService(userRepo)
 	mediaService := services.NewMediaService(mediaRepo, 50*1024*1024) // 50 MB
@@ -93,6 +94,7 @@ func main() {
 	auth.Post("/register", authHandler.Register)
 	auth.Post("/login/init", authHandler.LoginInit)
 	auth.Post("/login/verify", authHandler.LoginVerify)
+	auth.Post("/refresh", authHandler.Refresh)
 
 	webAuth := auth.Group("/web")
 	webAuth.Post("/session", webSessionHandler.CreateSession)
@@ -106,6 +108,7 @@ func main() {
 	user.Get("/lookup/:shadeId", userHandler.GetUserForLookup)
 	user.Get("/status/:shadeId", userHandler.GetUserStatus)
 	user.Patch("/fcm-token", userHandler.UpdateFCMToken)
+	user.Patch("/displayname", userHandler.UpdateDisplayName)
 
 	audit := v1.Group("/audit", middleware.Protected())
 	audit.Get("/me", auditHandler.GetMyLogs)
@@ -128,6 +131,8 @@ func main() {
 	invites := v1.Group("/invites", middleware.Protected())
 	invites.Post("/", groupHandler.CreateInvite)
 	invites.Get("/:code", groupHandler.RedeemInvite)
+
+	v1.Post("/translate", middleware.Protected(), handlers.TranslateHandler)
 
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
 	v1.Get("/ws/sync/:session_id", syncHandler.UpgradeAndServe)

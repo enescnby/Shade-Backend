@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"core-backend/internal/dto"
 	"core-backend/internal/services"
 	"errors"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -53,6 +55,33 @@ func (h *UserHandler) UpdateFCMToken(c *fiber.Ctx) error {
 
 	if err := h.userService.UpdateFCMToken(c.UserContext(), userID, body.FCMToken); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to update fcm token"})
+	}
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true})
+}
+
+// PATCH /user/displayname — kendi görünen adını güncelle
+func (h *UserHandler) UpdateDisplayName(c *fiber.Ctx) error {
+	userIDStr, ok := c.Locals("user_id").(string)
+	if !ok {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+	}
+	userID, err := uuid.Parse(userIDStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id"})
+	}
+
+	var req dto.UpdateDisplayNameRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request"})
+	}
+
+	name := strings.TrimSpace(req.DisplayName)
+	if len(name) > 64 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "display name too long (max 64)"})
+	}
+
+	if err := h.userService.UpdateDisplayName(c.UserContext(), userID, name); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to update display name"})
 	}
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{"ok": true})
 }

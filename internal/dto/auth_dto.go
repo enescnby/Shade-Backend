@@ -36,8 +36,18 @@ type LoginVerifyRequest struct {
 }
 
 type LoginVerifyResponse struct {
-	CoreGuardID string `json:"core_guard_id"`
-	UserID      string `json:"user_id"`
-	AccessToken string `json:"access_token"`
-	Message     string `json:"message"`
+	CoreGuardID  string `json:"core_guard_id"`
+	UserID       string `json:"user_id"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	Message      string `json:"message"`
+}
+
+type RefreshRequest struct {
+	RefreshToken string `json:"refresh_token"`
+}
+
+type RefreshResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"` // rotated
 }
