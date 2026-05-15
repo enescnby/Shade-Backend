@@ -33,9 +33,13 @@ func (h *MediaHandler) Upload(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid user id"})
 	}
 
+	// "image" (resim) veya "file" (ses/dosya) field'ını kabul et
 	fileHeader, err := c.FormFile("image")
 	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "image field is required"})
+		fileHeader, err = c.FormFile("file")
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "image or file field is required"})
+		}
 	}
 
 	file, err := fileHeader.Open()

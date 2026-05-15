@@ -9,6 +9,7 @@ import (
 type User struct {
 	UserID      uuid.UUID `gorm:"type:uuid;default:gen_random_uuid();primaryKey"`
 	CoreGuardID string    `gorm:"type:varchar;not null;unique"`
+	DisplayName string    `gorm:"type:varchar;default:''"` // kullanıcının seçtiği görünen ad
 	LastLoginAt time.Time
 	CreatedAt   time.Time
 

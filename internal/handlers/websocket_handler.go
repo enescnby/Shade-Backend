@@ -25,11 +25,7 @@ func (h *WebSocketHandler) UpgradeAndServe(c *fiber.Ctx) error {
 
 	token := extractBearerToken(c.Get("Authorization"))
 	if token == "" {
-		token = strings.TrimSpace(c.Query("token"))
-	}
-
-	if token == "" {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing token"})
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "missing authorization header"})
 	}
 
 	userID, _, deviceID, err := jwt.ParseToken(token)
