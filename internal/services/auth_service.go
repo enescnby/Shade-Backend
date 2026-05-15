@@ -299,11 +299,7 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 	}
 
 	// 7. JWT üret
-	accessToken, err := pkgjwt.GenerateToken(
-		user.UserID.String(),
-		user.CoreGuardID,
-		boundDevice.DeviceID.String(),
-	)
+	accessToken, err := pkgjwt.GenerateAccessToken(user.UserID.String(), user.CoreGuardID)
 	if err != nil {
 		logger.Log.Error("JWT generation failed", zap.Error(err))
 		return nil, errors.New("internal server error during token generation")
