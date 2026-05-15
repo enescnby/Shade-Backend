@@ -138,9 +138,9 @@ func (m *syncManager) ReadPump(sessionID, role string, conn *websocket.Conn) {
 		}
 
 		web.writeMu.Lock()
-		web.conn.SetWriteDeadline(time.Now().Add(SyncWriteTimeout))
+		_ = web.conn.SetWriteDeadline(time.Now().Add(SyncWriteTimeout))
 		err = web.conn.WriteMessage(msgType, payload)
-		web.conn.SetWriteDeadline(time.Time{})
+		_ = web.conn.SetWriteDeadline(time.Time{})
 		web.writeMu.Unlock()
 		if err != nil {
 			logger.Log.Error("sync forward to web failed", zap.String("session_id", sessionID), zap.Error(err))

@@ -188,14 +188,6 @@ func (s *webSessionService) GetSession(sessionID string) (*models.WebSession, er
 	return session, nil
 }
 
-func buildPollResponse(s *models.WebSession) *dto.SessionPollResponse {
-	return &dto.SessionPollResponse{
-		Ciphertext:       s.Ciphertext,
-		Nonce:            s.Nonce,
-		AndroidX25519Pub: s.AndroidX25519Pub,
-	}
-}
-
 func (s *webSessionService) buildAuthorizedPollResponse(session *models.WebSession) (*dto.SessionPollResponse, error) {
 	res := &dto.SessionPollResponse{
 		Ciphertext:       session.Ciphertext,
