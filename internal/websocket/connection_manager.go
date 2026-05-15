@@ -184,11 +184,6 @@ func (m *connectionManager) Register(userID, deviceID string, conn *websocket.Co
 	us.connsMu.Unlock()
 	m.mu.Unlock()
 
-	// Bağlanınca LastActive'i hemen güncelle
-	if uid, err := uuid.Parse(userID); err == nil {
-		go func() { _ = m.userRepo.UpdateLastActive(uid) }()
-	}
-
 	m.setupHeartbeat(userID, deviceID, cs)
 
 	logger.Log.Info("user device connected",
@@ -203,10 +198,6 @@ func (m *connectionManager) setupHeartbeat(userID, deviceID string, cs *connStat
 	_ = cs.conn.SetReadDeadline(time.Now().Add(pongWait))
 	cs.conn.SetPongHandler(func(string) error {
 		_ = cs.conn.SetReadDeadline(time.Now().Add(pongWait))
-		// Her pong'da LastActive'i güncelle (20 saniyede bir)
-		if uid, err := uuid.Parse(userID); err == nil {
-			go func() { _ = m.userRepo.UpdateLastActive(uid) }()
-		}
 		return nil
 	})
 

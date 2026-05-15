@@ -4,7 +4,7 @@ import (
 	"core-backend/internal/dto"
 	"core-backend/internal/models"
 	"core-backend/internal/repositories"
-	pkgjwt "core-backend/pkg/jwt"
+	"core-backend/pkg/jwt"
 	"core-backend/pkg/logger"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -22,9 +22,9 @@ import (
 // ── Challenge TTL sabitleri ──────────────────────────────────────────────────
 
 const (
-	challengeTTL             = 5 * time.Minute // Challenge geçerlilik süresi
-	challengeCleanupInterval = 2 * time.Minute // Temizlik goroutine aralığı
-	challengeNonceSize       = 32              // Byte cinsinden nonce boyutu
+	challengeTTL             = 5 * time.Minute  // Challenge geçerlilik süresi
+	challengeCleanupInterval = 2 * time.Minute  // Temizlik goroutine aralığı
+	challengeNonceSize       = 32               // Byte cinsinden nonce boyutu
 )
 
 // challengeEntry — TTL bilgisiyle birlikte challenge kaydı
@@ -39,16 +39,14 @@ type AuthService interface {
 	Register(req *dto.RegisterRequest) (*dto.RegisterResponse, error)
 	LoginInit(req *dto.LoginInitRequest) (*dto.LoginInitResponse, error)
 	LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerifyResponse, error)
-	Refresh(req *dto.RefreshRequest) (*dto.RefreshResponse, error)
 	Shutdown()
 }
 
 // ── Service implementation ───────────────────────────────────────────────────
 
 type authService struct {
-	userRepo         repositories.UserRepository
-	auditRepo        repositories.AuditRepository
-	refreshTokenRepo repositories.RefreshTokenRepository
+	userRepo  repositories.UserRepository
+	auditRepo repositories.AuditRepository
 
 	// Challenge cache — mutex ile korunan, TTL'li map
 	cacheMu        sync.Mutex
@@ -61,14 +59,12 @@ type authService struct {
 func NewAuthService(
 	userRepo repositories.UserRepository,
 	auditRepo repositories.AuditRepository,
-	refreshTokenRepo repositories.RefreshTokenRepository,
 ) AuthService {
 	svc := &authService{
-		userRepo:         userRepo,
-		auditRepo:        auditRepo,
-		refreshTokenRepo: refreshTokenRepo,
-		challengeCache:   make(map[string]challengeEntry),
-		stopCleanup:      make(chan struct{}),
+		userRepo:       userRepo,
+		auditRepo:      auditRepo,
+		challengeCache: make(map[string]challengeEntry),
+		stopCleanup:    make(chan struct{}),
 	}
 
 	// Arka planda süresi dolmuş challenge'ları temizle
@@ -299,24 +295,15 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 	}
 
 	// 7. JWT üret
-	accessToken, err := pkgjwt.GenerateAccessToken(user.UserID.String(), user.CoreGuardID)
+	tokenString, err := jwt.GenerateToken(
+		user.UserID.String(),
+		user.CoreGuardID,
+		boundDevice.DeviceID.String(),
+	)
 	if err != nil {
 		logger.Log.Error("JWT generation failed", zap.Error(err))
 		return nil, errors.New("internal server error during token generation")
 	}
-
-	rawRefresh, refreshHash, err := pkgjwt.GenerateOpaqueRefreshToken()
-	if err != nil {
-		logger.Log.Error("failed to generate refresh token", zap.Error(err))
-		return nil, errors.New("internal server error during token generation")
-	}
-
-	_ = s.refreshTokenRepo.Save(&models.RefreshToken{
-		UserID:    user.UserID,
-		TokenHash: refreshHash,
-		DeviceID:  0,
-		ExpiresAt: time.Now().Add(pkgjwt.RefreshTokenTTL),
-	})
 
 	_ = s.auditRepo.LogEvent(&models.SecurityAuditLog{
 		UserID:     user.UserID,
@@ -330,57 +317,11 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 	)
 
 	return &dto.LoginVerifyResponse{
-		AccessToken:  accessToken,
-		RefreshToken: rawRefresh,
-		CoreGuardID:  user.CoreGuardID,
-		UserID:       user.UserID.String(),
-		DeviceID:     boundDevice.DeviceID.String(),
-		Message:      "Welcome back! Cryptographic verification successful.",
-	}, nil
-}
-
-func (s *authService) Refresh(req *dto.RefreshRequest) (*dto.RefreshResponse, error) {
-	if req.RefreshToken == "" {
-		return nil, errors.New("refresh_token is required")
-	}
-
-	hash, err := pkgjwt.HashRefreshToken(req.RefreshToken)
-	if err != nil {
-		return nil, errors.New("invalid refresh token")
-	}
-
-	rt, err := s.refreshTokenRepo.FindByHash(hash)
-	if err != nil {
-		return nil, err
-	}
-
-	user, err := s.userRepo.GetUserByID(rt.UserID)
-	if err != nil {
-		return nil, errors.New("user not found")
-	}
-
-	_ = s.refreshTokenRepo.Delete(rt.ID)
-
-	newAccess, err := pkgjwt.GenerateAccessToken(user.UserID.String(), user.CoreGuardID)
-	if err != nil {
-		return nil, errors.New("failed to generate access token")
-	}
-
-	newRawRefresh, newHash, err := pkgjwt.GenerateOpaqueRefreshToken()
-	if err != nil {
-		return nil, errors.New("failed to generate refresh token")
-	}
-
-	_ = s.refreshTokenRepo.Save(&models.RefreshToken{
-		UserID:    user.UserID,
-		TokenHash: newHash,
-		DeviceID:  rt.DeviceID,
-		ExpiresAt: time.Now().Add(pkgjwt.RefreshTokenTTL),
-	})
-
-	return &dto.RefreshResponse{
-		AccessToken:  newAccess,
-		RefreshToken: newRawRefresh,
+		AccessToken: tokenString,
+		CoreGuardID: user.CoreGuardID,
+		UserID:      user.UserID.String(),
+		DeviceID:    boundDevice.DeviceID.String(),
+		Message:     "Welcome back! Cryptographic verification successful.",
 	}, nil
 }
 
