@@ -83,29 +83,35 @@ func main() {
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
 
-	auth := v1.Group("/auth")
+	// ── Auth — en sıkı limit: dakikada 10 istek / IP ────────────────────────
+	auth := v1.Group("/auth", middleware.NewAuthLimiter())
 	auth.Post("/register", authHandler.Register)
 	auth.Post("/login/init", authHandler.LoginInit)
 	auth.Post("/login/verify", authHandler.LoginVerify)
 
+	// Web session — auth grubundan miras alır (aynı limiter)
 	webAuth := auth.Group("/web")
 	webAuth.Post("/session", webSessionHandler.CreateSession)
 	webAuth.Get("/session/:session_id", webSessionHandler.PollSession)
 	webAuth.Post("/session/:session_id/authorize", middleware.Protected(), webSessionHandler.AuthorizeSession)
 
-	keys := v1.Group("/keys", middleware.Protected())
+	// ── Authenticated API — dakikada 120 istek / IP ──────────────────────────
+	keys := v1.Group("/keys", middleware.Protected(), middleware.NewAPILimiter())
 	keys.Get("/:id", keyHandler.GetPublicKey)
 
-	user := v1.Group("/user", middleware.Protected())
+	user := v1.Group("/user", middleware.Protected(), middleware.NewAPILimiter())
 	user.Get("/lookup/:shadeId", userHandler.GetUserForLookup)
 
-	media := v1.Group("/media", middleware.Protected())
+	// ── Medya — dakikada 20 istek / IP (bant genişliği koruması) ────────────
+	media := v1.Group("/media", middleware.Protected(), middleware.NewMediaLimiter())
 	media.Post("/upload", mediaHandler.Upload)
 	media.Get("/:imageId", mediaHandler.Download)
 
-	messages := v1.Group("/messages", middleware.Protected())
+	// ── Mesajlar — genel API limiti ──────────────────────────────────────────
+	messages := v1.Group("/messages", middleware.Protected(), middleware.NewAPILimiter())
 	messages.Get("/inbox", messageHandler.GetInbox)
 
+	// ── WebSocket — JWT doğrulaması connection_manager içinde yapılıyor ──────
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
 	v1.Get("/ws/sync/:session_id", syncHandler.UpgradeAndServe)
 
