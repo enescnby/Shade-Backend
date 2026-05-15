@@ -21,7 +21,7 @@ import (
 
 func main() {
 	logger.InitLogger()
-	defer logger.Log.Sync()
+	defer logger.Log.Sync() //nolint:errcheck // zap standard pattern
 
 	config.LoadConfig()
 
@@ -32,7 +32,7 @@ func main() {
 
 	rabbitClient, err := rabbitmq.NewClient(config.AppConfig)
 	if err != nil {
-		log.Fatalf("failed to connect rabbitmq: %v", err)
+		log.Fatalf("failed to connect rabbitmq: %v", err) //nolint:gocritic // intentional startup fatal
 	}
 	defer rabbitClient.Close()
 

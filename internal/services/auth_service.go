@@ -207,13 +207,13 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 
 func generateCoreGuardID() string {
 	bytes := make([]byte, 4)
-	rand.Read(bytes)
+	_, _ = rand.Read(bytes)
 	hexStr := strings.ToUpper(hex.EncodeToString(bytes))
 	return "CG-" + hexStr[:4] + "-" + hexStr[4:]
 }
 
 func generateCryptoChallenge() string {
 	bytes := make([]byte, 32)
-	rand.Read(bytes)
+	_, _ = rand.Read(bytes)
 	return hex.EncodeToString(bytes)
 }
