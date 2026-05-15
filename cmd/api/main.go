@@ -78,6 +78,7 @@ func main() {
 	msgRepo := repositories.NewMessageRepository(database.DB)
 	mediaRepo := repositories.NewMediaRepository(database.DB, r2Client, config.AppConfig.R2BucketName)
 	webSessionRepo := repositories.NewWebSessionRepository(database.DB)
+	groupRepo := repositories.NewGroupRepository(database.DB)
 
 	authService := services.NewAuthService(userRepo, auditRepo)
 	keyService := services.NewKeyService(keyRepo)
@@ -85,6 +86,7 @@ func main() {
 	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
 	messageService := services.NewMessageService(rabbitClient)
 	webSessionService := services.NewSessionService(webSessionRepo, userRepo)
+	groupService := services.NewGroupService(groupRepo, userRepo)
 
 	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService, rabbitClient)
 	wsHandler := handlers.NewWebSocketHandler(cm)
@@ -99,6 +101,7 @@ func main() {
 	messageHandler := handlers.NewMessageHandler(messageService)
 	webSessionHandler := handlers.NewWebSessionHandler(webSessionService)
 	syncHandler := handlers.NewSyncHandler(syncManager, webSessionService)
+	groupHandler := handlers.NewGroupHandler(groupService)
 
 	// ── Route'lar ────────────────────────────────────────────────────────────
 	// ── Health endpoints — auth ve rate limit YOK ──────────────────────────
@@ -135,6 +138,19 @@ func main() {
 	// ── Mesajlar — genel API limiti ──────────────────────────────────────────
 	messages := v1.Group("/messages", middleware.Protected(), middleware.NewAPILimiter())
 	messages.Get("/inbox", messageHandler.GetInbox)
+
+	// ── Gruplar ──────────────────────────────────────────────────────────────
+	groups := v1.Group("/groups", middleware.Protected(), middleware.NewAPILimiter())
+	groups.Post("/", groupHandler.CreateGroup)
+	groups.Get("/", groupHandler.ListGroups)
+	groups.Get("/:id", groupHandler.GetGroup)
+	groups.Delete("/:id", groupHandler.DeleteGroup)
+	groups.Post("/:id/members", groupHandler.AddMember)
+	groups.Delete("/:id/members/:userId", groupHandler.RemoveMember)
+
+	invites := v1.Group("/invites", middleware.Protected(), middleware.NewAPILimiter())
+	invites.Post("/", groupHandler.CreateInvite)
+	invites.Get("/:code", groupHandler.RedeemInvite)
 
 	// ── WebSocket — JWT doğrulaması connection_manager içinde yapılıyor ──────
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
