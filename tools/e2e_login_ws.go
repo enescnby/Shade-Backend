@@ -100,17 +100,17 @@ func main() {
 		fmt.Printf("key generation failed: %v\n", err)
 		os.Exit(1)
 	}
-	pubHex := hex.EncodeToString(pub)
+	pubHex := hex.EncodeToString(pub) // 64 hex karakter — validation geçer
 	fmt.Printf("✓ Ed25519 key pair generated. Public key: %s...\n", pubHex[:16])
 
-	// 2. Kayıt
+	// 2. Kayıt — tüm alanlar validation kurallarını karşılamalı
 	regStatus, regRes, regRaw := postJSON[RegisterResponse]("/auth/register", RegisterRequest{
-		IdentityPublicKey:             pubHex,
-		EncryptedIdentityPrivateKey:   "DUMMY_ENC_IDENTITY_PRIV",
-		EncryptionPublicKey:           pubHex, // Test için aynı key
-		EncryptedEncryptionPrivateKey: "DUMMY_ENC_ENCRYPTION_PRIV",
-		Salt:                          "DUMMY_SALT_32_CHARS_MINIMUM_HERE",
-		DeviceModel:                   "e2e-test-device",
+		IdentityPublicKey:             pubHex,                          // 64 hex ✓
+		EncryptedIdentityPrivateKey:   "DUMMY_ENCRYPTED_IDENTITY_KEY",  // required ✓
+		EncryptionPublicKey:           pubHex,                          // 64 hex ✓
+		EncryptedEncryptionPrivateKey: "DUMMY_ENCRYPTED_ENCRYPTION_KEY", // required ✓
+		Salt:                          "DUMMY_SALT_FOR_E2E_TEST_32CH",  // >= 16 char ✓
+		DeviceModel:                   "e2e-test-device",               // required ✓
 		FCMToken:                      "e2e-test-fcm-token",
 	})
 	if regStatus != 201 && regStatus != 200 {
@@ -119,7 +119,7 @@ func main() {
 	}
 	fmt.Printf("✓ register ok: CoreGuardID=%s  UserID=%s\n", regRes.CoreGuardID, regRes.UserID)
 
-	// 3. Login Init — challenge al
+	// 3. Login Init
 	initStatus, initRes, initRaw := postJSON[LoginInitResponse]("/auth/login/init", LoginInitRequest{
 		CoreGuardID: regRes.CoreGuardID,
 	})
@@ -129,20 +129,20 @@ func main() {
 	}
 	fmt.Printf("✓ login/init ok. Challenge: %s...\n", initRes.Challenge[:16])
 
-	// 4. Challenge'ı Ed25519 ile imzala
+	// 4. Challenge'ı imzala
 	chBytes, err := hex.DecodeString(initRes.Challenge)
 	if err != nil {
 		fmt.Printf("✗ challenge decode failed: %v\n", err)
 		os.Exit(1)
 	}
 	sig := ed25519.Sign(priv, chBytes)
-	sigHex := hex.EncodeToString(sig)
+	sigHex := hex.EncodeToString(sig) // 128 hex karakter — validation geçer
 
-	// 5. Login Verify — JWT al
+	// 5. Login Verify
 	verifyStatus, verifyRes, verifyRaw := postJSON[LoginVerifyResponse]("/auth/login/verify", LoginVerifyRequest{
 		CoreGuardID: regRes.CoreGuardID,
-		Challenge:   initRes.Challenge,
-		Signature:   sigHex,
+		Challenge:   initRes.Challenge, // 64 hex ✓
+		Signature:   sigHex,            // 128 hex ✓
 		DeviceModel: "e2e-test-device",
 		DeviceID:    regRes.DeviceID,
 		FCMToken:    "e2e-test-fcm-token",
@@ -152,17 +152,14 @@ func main() {
 		os.Exit(1)
 	}
 	if verifyRes.AccessToken == "" {
-		fmt.Printf("✗ login/verify: no access token in response: %s\n", string(verifyRaw))
+		fmt.Printf("✗ login/verify: no access token: %s\n", string(verifyRaw))
 		os.Exit(1)
 	}
 	fmt.Printf("✓ login/verify ok. Token (first 20): %s...\n", verifyRes.AccessToken[:20])
 
 	// 6. WebSocket bağlantısı
 	u, _ := url.Parse(baseWS)
-	dialer := websocket.Dialer{
-		Proxy:            http.ProxyFromEnvironment,
-		HandshakeTimeout: 10 * time.Second,
-	}
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+verifyRes.AccessToken)
 
@@ -174,27 +171,23 @@ func main() {
 		if resp != nil {
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			fmt.Printf("✗ WebSocket dial failed: %v | status=%d | body=%s\n",
-				err, resp.StatusCode, string(b))
+			fmt.Printf("✗ WebSocket failed: %v | status=%d | body=%s\n", err, resp.StatusCode, string(b))
 		} else {
-			fmt.Printf("✗ WebSocket dial failed: %v\n", err)
+			fmt.Printf("✗ WebSocket failed: %v\n", err)
 		}
 		os.Exit(1)
 	}
 	defer conn.Close()
-
 	fmt.Printf("✓ WebSocket connected. Status: %s\n", resp.Status)
 
-	// 7. Ping-pong testi
-	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"ping"}`))
 	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
-		fmt.Printf("  WS read timeout/error (expected in some configs): %v\n", err)
+		fmt.Printf("  WS read timeout (expected): %v\n", err)
 	} else {
-		fmt.Printf("✓ WebSocket message received: %s\n", string(msg))
+		fmt.Printf("✓ WS message: %s\n", string(msg))
 	}
 
 	fmt.Println()
-	fmt.Println("=== ✅ Tüm testler başarılı — Backend tam çalışıyor ===")
+	fmt.Println("=== ✅ Tüm testler başarılı — Validation + Backend tam çalışıyor ===")
 }

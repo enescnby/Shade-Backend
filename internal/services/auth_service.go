@@ -372,14 +372,14 @@ func (s *authService) resolveDevice(user *models.User, req *dto.LoginVerifyReque
 // ── Yardımcı fonksiyonlar ────────────────────────────────────────────────────
 
 func generateCoreGuardID() string {
-	b := make([]byte, 4)
-	rand.Read(b)
-	hexStr := strings.ToUpper(hex.EncodeToString(b))
+	bytes := make([]byte, 4)
+	_, _ = rand.Read(bytes)
+	hexStr := strings.ToUpper(hex.EncodeToString(bytes))
 	return "CG-" + hexStr[:4] + "-" + hexStr[4:]
 }
 
 func generateCryptoChallenge() string {
-	b := make([]byte, challengeNonceSize)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	bytes := make([]byte, 32)
+	_, _ = rand.Read(bytes)
+	return hex.EncodeToString(bytes)
 }
