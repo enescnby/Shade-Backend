@@ -72,6 +72,7 @@ func main() {
 	wsHandler := handlers.NewWebSocketHandler(cm)
 	syncManager := websocket.NewSyncManager()
 
+	healthHandler := handlers.NewHealthHandler()
 	authHandler := handlers.NewAuthHandler(authService)
 	keyHandler := handlers.NewKeyHandler(keyService)
 	userHandler := handlers.NewUserHandler(userService)
@@ -79,6 +80,10 @@ func main() {
 	messageHandler := handlers.NewMessageHandler(messageService)
 	webSessionHandler := handlers.NewWebSessionHandler(webSessionService)
 	syncHandler := handlers.NewSyncHandler(syncManager, webSessionService)
+
+	// ── Health endpoints — auth ve rate limit YOK ──────────────────────────
+	app.Get("/health/live", healthHandler.Live)
+	app.Get("/health/ready", healthHandler.Ready)
 
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
