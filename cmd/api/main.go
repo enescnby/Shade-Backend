@@ -1,25 +1,29 @@
 package main
 
 import (
-	"core-backend/internal/rabbitmq"
-	"core-backend/pkg/firebase"
-	"core-backend/pkg/storage"
-	"log"
-
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors"
-
 	"core-backend/internal/config"
 	"core-backend/internal/database"
 	"core-backend/internal/handlers"
 	"core-backend/internal/middleware"
+	"core-backend/internal/rabbitmq"
 	"core-backend/internal/repositories"
 	"core-backend/internal/services"
 	"core-backend/internal/websocket"
+	"core-backend/pkg/firebase"
 	"core-backend/pkg/logger"
+	"core-backend/pkg/storage"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
+	"go.uber.org/zap"
 )
 
 func main() {
+	// ── Başlatma ────────────────────────────────────────────────────────────
 	logger.InitLogger()
 	defer logger.Log.Sync()
 
@@ -32,15 +36,28 @@ func main() {
 
 	rabbitClient, err := rabbitmq.NewClient(config.AppConfig)
 	if err != nil {
-		log.Fatalf("failed to connect rabbitmq: %v", err)
+		log.Fatalf("RabbitMQ connection failed: %v", err)
 	}
 	defer rabbitClient.Close()
 
 	if err := rabbitmq.DeclareTopology(rabbitClient); err != nil {
-		log.Fatalf("failed to declare rabbitmq topology: %v", err)
+		log.Fatalf("RabbitMQ topology declaration failed: %v", err)
 	}
 
-	app := fiber.New()
+	// ── Fiber ────────────────────────────────────────────────────────────────
+	app := fiber.New(fiber.Config{
+		// Panic'leri yakala — sunucu çökmeden devam etsin
+		ErrorHandler: func(c *fiber.Ctx, err error) error {
+			logger.Log.Error("unhandled request error",
+				zap.Error(err),
+				zap.String("path", c.Path()),
+				zap.String("method", c.Method()),
+			)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "internal server error",
+			})
+		},
+	})
 
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     "http://localhost:5173, https://web.shadeapp.tech",
@@ -49,6 +66,7 @@ func main() {
 		AllowCredentials: true,
 	}))
 
+	// ── Bağımlılıklar ────────────────────────────────────────────────────────
 	firebaseApp := firebase.InitFirebase()
 	firebaseService := services.NewFCMService(firebaseApp)
 
@@ -72,6 +90,7 @@ func main() {
 	wsHandler := handlers.NewWebSocketHandler(cm)
 	syncManager := websocket.NewSyncManager()
 
+	// ── Handler'lar ──────────────────────────────────────────────────────────
 	authHandler := handlers.NewAuthHandler(authService)
 	keyHandler := handlers.NewKeyHandler(keyService)
 	userHandler := handlers.NewUserHandler(userService)
@@ -80,6 +99,7 @@ func main() {
 	webSessionHandler := handlers.NewWebSessionHandler(webSessionService)
 	syncHandler := handlers.NewSyncHandler(syncManager, webSessionService)
 
+	// ── Route'lar ────────────────────────────────────────────────────────────
 	api := app.Group("/api")
 	v1 := api.Group("/v1")
 
@@ -109,6 +129,33 @@ func main() {
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
 	v1.Get("/ws/sync/:session_id", syncHandler.UpgradeAndServe)
 
-	logger.Log.Info("CoreGuard API is starting...")
-	log.Fatal(app.Listen(config.AppConfig.AppPort))
+	// ── Graceful Shutdown ────────────────────────────────────────────────────
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-quit
+		logger.Log.Info("shutdown signal received — stopping gracefully")
+
+		// Auth service cleanup goroutine'ini durdur
+		authService.Shutdown()
+
+		// Yeni bağlantıları reddet, mevcut istekleri tamamla
+		if err := app.Shutdown(); err != nil {
+			logger.Log.Error("server shutdown error", zap.Error(err))
+		}
+
+		logger.Log.Info("server stopped cleanly")
+		os.Exit(0)
+	}()
+
+	// ── Başlat ───────────────────────────────────────────────────────────────
+	logger.Log.Info("CoreGuard API starting",
+		zap.String("port", config.AppConfig.AppPort),
+		zap.String("env", "development"),
+	)
+
+	if err := app.Listen(config.AppConfig.AppPort); err != nil {
+		logger.Log.Fatal("server failed to start", zap.Error(err))
+	}
 }
