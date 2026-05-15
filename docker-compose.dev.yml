@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: shade_postgres
+    environment:
+      POSTGRES_USER: shade
+      POSTGRES_PASSWORD: shade_dev_2026
+      POSTGRES_DB: shade_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - shade_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shade -d shade_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: shade_rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: shade
+      RABBITMQ_DEFAULT_PASS: shade_dev_2026
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  shade_pgdata:

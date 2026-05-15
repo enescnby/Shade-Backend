@@ -6,6 +6,7 @@ import (
 	"core-backend/pkg/logger"
 
 	"github.com/joho/godotenv"
+	"go.uber.org/zap"
 )
 
 type Config struct {
@@ -36,18 +37,17 @@ type Config struct {
 var AppConfig Config
 
 func LoadConfig() {
-	err := godotenv.Load()
-	if err != nil {
-		logger.Log.Warn(".env file can not be found")
+	if err := godotenv.Load(); err != nil {
+		logger.Log.Warn(".env file not found — reading from environment variables")
 	}
 
 	AppConfig = Config{
-		AppPort:    getEnv("APP_PORT", ""),
+		AppPort:    getEnv("APP_PORT", ":8080"),
 		DBHost:     getEnv("DB_HOST", ""),
 		DBUser:     getEnv("DB_USER", ""),
 		DBPassword: getEnv("DB_PASSWORD", ""),
 		DBName:     getEnv("DB_NAME", ""),
-		DBPort:     getEnv("DB_PORT", ""),
+		DBPort:     getEnv("DB_PORT", "5432"),
 		DBSSLMode:  getEnv("DB_SSL_MODE", "disable"),
 		DBTimeZone: getEnv("DB_TIMEZONE", "Europe/Istanbul"),
 		JWTSecret:  getEnv("JWT_SECRET", ""),
@@ -66,7 +66,27 @@ func LoadConfig() {
 		GeminiAPIKey: getEnv("GEMINI_API_KEY", ""),
 	}
 
-	logger.Log.Info("Configuration successfully imported!")
+	validateConfig()
+	logger.Log.Info("Configuration loaded successfully")
+}
+
+// validateConfig — kritik değerler eksikse başlatma sırasında hata ver
+func validateConfig() {
+	if AppConfig.JWTSecret == "" {
+		logger.Log.Fatal("JWT_SECRET must be set in .env file",
+			zap.String("fix", "run: openssl rand -hex 32"),
+		)
+	}
+
+	if len(AppConfig.JWTSecret) < 32 {
+		logger.Log.Fatal("JWT_SECRET is too short — minimum 32 characters required",
+			zap.Int("current_length", len(AppConfig.JWTSecret)),
+		)
+	}
+
+	if AppConfig.DBHost == "" || AppConfig.DBUser == "" || AppConfig.DBName == "" {
+		logger.Log.Fatal("Database configuration is incomplete — check DB_HOST, DB_USER, DB_NAME in .env")
+	}
 }
 
 func getEnv(key, fallback string) string {
