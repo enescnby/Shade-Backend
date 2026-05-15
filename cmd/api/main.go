@@ -40,13 +40,15 @@ func main() {
 		log.Fatalf("failed to declare rabbitmq topology: %v", err)
 	}
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		BodyLimit: 50 * 1024 * 1024, // 50 MB — ses ve dosya paylaşımı için
+	})
 
 	app.Use(cors.New(cors.Config{
 		AllowOrigins:     "http://localhost:5173, https://web.shadeapp.tech",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization",
 		AllowMethods:     "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-		AllowCredentials: true,
+		AllowCredentials: false,
 	}))
 
 	firebaseApp := firebase.InitFirebase()
@@ -57,16 +59,19 @@ func main() {
 	keyRepo := repositories.NewKeyRepository(database.DB)
 	userRepo := repositories.NewUserRepository(database.DB)
 	auditRepo := repositories.NewAuditRepository(database.DB)
+	refreshTokenRepo := repositories.NewRefreshTokenRepository(database.DB)
 	msgRepo := repositories.NewMessageRepository(database.DB)
 	mediaRepo := repositories.NewMediaRepository(database.DB, r2Client, config.AppConfig.R2BucketName)
 	webSessionRepo := repositories.NewWebSessionRepository(database.DB)
+	groupRepo := repositories.NewGroupRepository(database.DB)
 
-	authService := services.NewAuthService(userRepo, auditRepo)
+	authService := services.NewAuthService(userRepo, auditRepo, refreshTokenRepo)
 	keyService := services.NewKeyService(keyRepo)
 	userService := services.NewUserService(userRepo)
-	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
+	mediaService := services.NewMediaService(mediaRepo, 50*1024*1024) // 50 MB
 	messageService := services.NewMessageService(rabbitClient)
 	webSessionService := services.NewSessionService(webSessionRepo, userRepo)
+	groupService := services.NewGroupService(groupRepo, userRepo)
 
 	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService, rabbitClient)
 	wsHandler := handlers.NewWebSocketHandler(cm)
@@ -76,10 +81,12 @@ func main() {
 	authHandler := handlers.NewAuthHandler(authService)
 	keyHandler := handlers.NewKeyHandler(keyService)
 	userHandler := handlers.NewUserHandler(userService)
+	auditHandler := handlers.NewAuditHandler(auditRepo)
 	mediaHandler := handlers.NewMediaHandler(mediaService)
 	messageHandler := handlers.NewMessageHandler(messageService)
 	webSessionHandler := handlers.NewWebSessionHandler(webSessionService)
 	syncHandler := handlers.NewSyncHandler(syncManager, webSessionService)
+	groupHandler := handlers.NewGroupHandler(groupService)
 
 	// ── Health endpoints — auth ve rate limit YOK ──────────────────────────
 	app.Get("/health/live", healthHandler.Live)
@@ -92,6 +99,7 @@ func main() {
 	auth.Post("/register", authHandler.Register)
 	auth.Post("/login/init", authHandler.LoginInit)
 	auth.Post("/login/verify", authHandler.LoginVerify)
+	auth.Post("/refresh", authHandler.Refresh)
 
 	webAuth := auth.Group("/web")
 	webAuth.Post("/session", webSessionHandler.CreateSession)
@@ -103,6 +111,12 @@ func main() {
 
 	user := v1.Group("/user", middleware.Protected())
 	user.Get("/lookup/:shadeId", userHandler.GetUserForLookup)
+	user.Get("/status/:shadeId", userHandler.GetUserStatus)
+	user.Patch("/fcm-token", userHandler.UpdateFCMToken)
+	user.Patch("/displayname", userHandler.UpdateDisplayName)
+
+	audit := v1.Group("/audit", middleware.Protected())
+	audit.Get("/me", auditHandler.GetMyLogs)
 
 	media := v1.Group("/media", middleware.Protected())
 	media.Post("/upload", mediaHandler.Upload)
@@ -110,6 +124,20 @@ func main() {
 
 	messages := v1.Group("/messages", middleware.Protected())
 	messages.Get("/inbox", messageHandler.GetInbox)
+
+	groups := v1.Group("/groups", middleware.Protected())
+	groups.Post("/", groupHandler.CreateGroup)
+	groups.Get("/", groupHandler.ListGroups)
+	groups.Get("/:id", groupHandler.GetGroup)
+	groups.Delete("/:id", groupHandler.DeleteGroup)
+	groups.Post("/:id/members", groupHandler.AddMember)
+	groups.Delete("/:id/members/:userId", groupHandler.RemoveMember)
+
+	invites := v1.Group("/invites", middleware.Protected())
+	invites.Post("/", groupHandler.CreateInvite)
+	invites.Get("/:code", groupHandler.RedeemInvite)
+
+	v1.Post("/translate", middleware.Protected(), handlers.TranslateHandler)
 
 	v1.Get("/ws", wsHandler.UpgradeAndServe)
 	v1.Get("/ws/sync/:session_id", syncHandler.UpgradeAndServe)

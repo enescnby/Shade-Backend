@@ -69,3 +69,18 @@ func (h *AuthHandler) LoginVerify(c *fiber.Ctx) error {
 
 	return c.Status(fiber.StatusOK).JSON(res)
 }
+
+// POST /auth/refresh
+func (h *AuthHandler) Refresh(c *fiber.Ctx) error {
+	var req dto.RefreshRequest
+	if err := c.BodyParser(&req); err != nil || req.RefreshToken == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "refresh_token required"})
+	}
+
+	res, err := h.authService.Refresh(&req)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(res)
+}

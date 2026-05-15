@@ -57,6 +57,10 @@ func Migrate() {
 		&models.SecurityAuditLog{},
 		&models.ImageMetaData{},
 		&models.WebSession{},
+		&models.Group{},
+		&models.GroupMember{},
+		&models.ContactInvite{},
+		&models.RefreshToken{},
 	)
 
 	if err != nil {

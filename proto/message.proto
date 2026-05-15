@@ -26,6 +26,7 @@ message EncryptedPayload {
 
   int64 timestamp = 8;
   MessageType type = 9;
+  string group_id = 10; // empty for 1:1 messages, group UUID for group messages
 }
 
 message DeliveryReceipt {
