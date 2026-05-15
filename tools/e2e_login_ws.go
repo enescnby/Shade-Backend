@@ -19,6 +19,8 @@ import (
 const baseHTTP = "http://127.0.0.1:8080/api/v1"
 const baseWS = "ws://127.0.0.1:8080/api/v1/ws"
 
+// ── Request / Response tipleri — gerçek DTO ile eşleşiyor ──────────────────
+
 type RegisterRequest struct {
 	IdentityPublicKey             string `json:"identity_public_key"`
 	EncryptedIdentityPrivateKey   string `json:"encrypted_identity_private_key"`
@@ -64,6 +66,8 @@ type LoginVerifyResponse struct {
 	Message     string `json:"message"`
 }
 
+// ── HTTP yardımcısı ─────────────────────────────────────────────────────────
+
 func postJSON[T any](path string, body any) (int, T, []byte) {
 	var out T
 	b, _ := json.Marshal(body)
@@ -83,6 +87,8 @@ func postJSON[T any](path string, body any) (int, T, []byte) {
 	_ = json.Unmarshal(raw, &out)
 	return resp.StatusCode, out, raw
 }
+
+// ── Ana akış ────────────────────────────────────────────────────────────────
 
 func main() {
 	fmt.Println("=== E2E Test: register → login/init → login/verify → WebSocket ===")

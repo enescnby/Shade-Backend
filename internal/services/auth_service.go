@@ -19,27 +19,143 @@ import (
 	"gorm.io/gorm"
 )
 
+// ── Challenge TTL sabitleri ──────────────────────────────────────────────────
+
+const (
+	challengeTTL             = 5 * time.Minute  // Challenge geçerlilik süresi
+	challengeCleanupInterval = 2 * time.Minute  // Temizlik goroutine aralığı
+	challengeNonceSize       = 32               // Byte cinsinden nonce boyutu
+)
+
+// challengeEntry — TTL bilgisiyle birlikte challenge kaydı
+type challengeEntry struct {
+	value     string
+	expiresAt time.Time
+}
+
+// ── Service interface ────────────────────────────────────────────────────────
+
 type AuthService interface {
 	Register(req *dto.RegisterRequest) (*dto.RegisterResponse, error)
 	LoginInit(req *dto.LoginInitRequest) (*dto.LoginInitResponse, error)
 	LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerifyResponse, error)
+	Shutdown()
 }
+
+// ── Service implementation ───────────────────────────────────────────────────
 
 type authService struct {
-	userRepo       repositories.UserRepository
-	auditRepo      repositories.AuditRepository
-	challengeCache sync.Map
+	userRepo  repositories.UserRepository
+	auditRepo repositories.AuditRepository
+
+	// Challenge cache — mutex ile korunan, TTL'li map
+	cacheMu        sync.Mutex
+	challengeCache map[string]challengeEntry
+
+	// Cleanup goroutine kontrolü
+	stopCleanup chan struct{}
 }
 
-func NewAuthService(userRepo repositories.UserRepository, auditRepo repositories.AuditRepository) AuthService {
-	return &authService{
-		userRepo:  userRepo,
-		auditRepo: auditRepo,
+func NewAuthService(
+	userRepo repositories.UserRepository,
+	auditRepo repositories.AuditRepository,
+) AuthService {
+	svc := &authService{
+		userRepo:       userRepo,
+		auditRepo:      auditRepo,
+		challengeCache: make(map[string]challengeEntry),
+		stopCleanup:    make(chan struct{}),
+	}
+
+	// Arka planda süresi dolmuş challenge'ları temizle
+	go svc.runCleanupWorker()
+
+	return svc
+}
+
+// Shutdown — uygulama kapanırken cleanup goroutine'i düzgünce durdurur
+func (s *authService) Shutdown() {
+	close(s.stopCleanup)
+}
+
+// runCleanupWorker — periyodik olarak süresi dolmuş challenge'ları temizler
+func (s *authService) runCleanupWorker() {
+	ticker := time.NewTicker(challengeCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.evictExpiredChallenges()
+		case <-s.stopCleanup:
+			logger.Log.Info("challenge cleanup worker stopped")
+			return
+		}
 	}
 }
 
+// evictExpiredChallenges — lock altında süresi dolmuş tüm kayıtları siler
+func (s *authService) evictExpiredChallenges() {
+	now := time.Now()
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	evicted := 0
+	for key, entry := range s.challengeCache {
+		if now.After(entry.expiresAt) {
+			delete(s.challengeCache, key)
+			evicted++
+		}
+	}
+
+	if evicted > 0 {
+		logger.Log.Info("expired challenges evicted",
+			zap.Int("count", evicted),
+			zap.Int("remaining", len(s.challengeCache)),
+		)
+	}
+}
+
+// storeChallenge — yeni challenge'ı TTL ile birlikte cache'e yazar
+func (s *authService) storeChallenge(coreGuardID, challenge string) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	s.challengeCache[coreGuardID] = challengeEntry{
+		value:     challenge,
+		expiresAt: time.Now().Add(challengeTTL),
+	}
+}
+
+// consumeChallenge — challenge'ı doğrular, siler ve TTL kontrolü yapar.
+// Her durumda (geçerli, süresi dolmuş, bulunamadı) challenge silinir — replay önlemi.
+func (s *authService) consumeChallenge(coreGuardID, challenge string) error {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+
+	entry, exists := s.challengeCache[coreGuardID]
+
+	// Her durumda sil (replay attack önlemi)
+	delete(s.challengeCache, coreGuardID)
+
+	if !exists {
+		return errors.New("challenge not found — request a new one via login/init")
+	}
+
+	if time.Now().After(entry.expiresAt) {
+		return errors.New("challenge expired — request a new one via login/init")
+	}
+
+	if entry.value != challenge {
+		return errors.New("challenge mismatch")
+	}
+
+	return nil
+}
+
+// ── Register ─────────────────────────────────────────────────────────────────
+
 func (s *authService) Register(req *dto.RegisterRequest) (*dto.RegisterResponse, error) {
-	logger.Log.Info("starting registration process for new device", zap.String("device_model", req.DeviceModel))
+	logger.Log.Info("registration started", zap.String("device_model", req.DeviceModel))
 
 	coreGuardID := generateCoreGuardID()
 
@@ -59,25 +175,26 @@ func (s *authService) Register(req *dto.RegisterRequest) (*dto.RegisterResponse,
 	}
 
 	if err := s.userRepo.CreateUser(newUser); err != nil {
-		logger.Log.Error("registration failed at repository layer", zap.Error(err))
+		logger.Log.Error("registration failed", zap.Error(err))
 		return nil, err
 	}
 
 	dev, err := s.userRepo.GetDeviceByUserID(newUser.UserID)
 	if err != nil {
-		logger.Log.Error("registration succeeded but device row not found", zap.Error(err))
+		logger.Log.Error("device not found after registration", zap.Error(err))
 		return nil, errors.New("could not load device after registration")
 	}
 
-	auditLog := &models.SecurityAuditLog{
+	_ = s.auditRepo.LogEvent(&models.SecurityAuditLog{
 		UserID:     newUser.UserID,
 		ActionType: "USER_REGISTERED",
 		IPAddress:  "system",
-	}
+	})
 
-	_ = s.auditRepo.LogEvent(auditLog)
-
-	logger.Log.Info("registration completed successfully", zap.String("core_guard_id", coreGuardID))
+	logger.Log.Info("registration completed",
+		zap.String("core_guard_id", coreGuardID),
+		zap.String("user_id", newUser.UserID.String()),
+	)
 
 	return &dto.RegisterResponse{
 		CoreGuardID: coreGuardID,
@@ -87,18 +204,27 @@ func (s *authService) Register(req *dto.RegisterRequest) (*dto.RegisterResponse,
 	}, nil
 }
 
+// ── LoginInit ────────────────────────────────────────────────────────────────
+
 func (s *authService) LoginInit(req *dto.LoginInitRequest) (*dto.LoginInitResponse, error) {
 	logger.Log.Info("login init requested", zap.String("core_guard_id", req.CoreGuardID))
 
 	user, err := s.userRepo.GetUserByCoreGuardID(req.CoreGuardID)
 	if err != nil {
+		// Timing attack önlemi: kullanıcı bulunamasa bile aynı süre geçiyor gibi görünsün
+		time.Sleep(50 * time.Millisecond)
 		return nil, errors.New("user not found")
 	}
 
 	challenge := generateCryptoChallenge()
-	s.challengeCache.Store(req.CoreGuardID, challenge)
 
-	logger.Log.Info("challenge generated for user", zap.String("core_guard_id", req.CoreGuardID))
+	// TTL ile birlikte cache'e yaz
+	s.storeChallenge(req.CoreGuardID, challenge)
+
+	logger.Log.Info("challenge issued",
+		zap.String("core_guard_id", req.CoreGuardID),
+		zap.Time("expires_at", time.Now().Add(challengeTTL)),
+	)
 
 	return &dto.LoginInitResponse{
 		EncryptedIdentityPrivateKey:   user.Key.EncryptedIdentityPrivateKey,
@@ -108,83 +234,74 @@ func (s *authService) LoginInit(req *dto.LoginInitRequest) (*dto.LoginInitRespon
 	}, nil
 }
 
-func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerifyResponse, error) {
+// ── LoginVerify ───────────────────────────────────────────────────────────────
 
+func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerifyResponse, error) {
 	logger.Log.Info("login verify requested", zap.String("core_guard_id", req.CoreGuardID))
 
-	cachedChallenge, exists := s.challengeCache.Load(req.CoreGuardID)
-	if !exists || cachedChallenge.(string) != req.Challenge {
-		logger.Log.Warn("invalid or expired challenge", zap.String("core_guard_id", req.CoreGuardID))
-		return nil, errors.New("invalid or expired challenge")
+	// 1. Challenge'ı doğrula ve tüket (TTL + replay kontrolü dahil)
+	if err := s.consumeChallenge(req.CoreGuardID, req.Challenge); err != nil {
+		logger.Log.Warn("challenge validation failed",
+			zap.String("core_guard_id", req.CoreGuardID),
+			zap.Error(err),
+		)
+		return nil, err
 	}
 
-	s.challengeCache.Delete(req.CoreGuardID)
-
+	// 2. Kullanıcıyı getir
 	user, err := s.userRepo.GetUserByCoreGuardID(req.CoreGuardID)
 	if err != nil {
 		return nil, errors.New("user not found")
 	}
 
-	pubKeyBytes, _ := hex.DecodeString(user.Key.IdentityPublicKey)
-	signatureBytes, _ := hex.DecodeString(req.Signature)
-	challengeBytes, _ := hex.DecodeString(req.Challenge)
+	// 3. Public key decode
+	pubKeyBytes, err := hex.DecodeString(user.Key.IdentityPublicKey)
+	if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
+		logger.Log.Error("invalid public key in database",
+			zap.String("core_guard_id", req.CoreGuardID),
+			zap.Int("key_length", len(pubKeyBytes)),
+		)
+		return nil, errors.New("invalid key configuration")
+	}
 
-	isValid := ed25519.Verify(pubKeyBytes, challengeBytes, signatureBytes)
-	if !isValid {
-		logger.Log.Warn("cryptographic signature verification failed", zap.String("core_guard_id", req.CoreGuardID))
+	// 4. İmza ve challenge decode
+	signatureBytes, err := hex.DecodeString(req.Signature)
+	if err != nil {
+		return nil, errors.New("invalid signature format")
+	}
 
+	challengeBytes, err := hex.DecodeString(req.Challenge)
+	if err != nil {
+		return nil, errors.New("invalid challenge format")
+	}
+
+	// 5. Ed25519 imza doğrulaması
+	if !ed25519.Verify(pubKeyBytes, challengeBytes, signatureBytes) {
+		logger.Log.Warn("signature verification failed",
+			zap.String("core_guard_id", req.CoreGuardID),
+		)
 		_ = s.auditRepo.LogEvent(&models.SecurityAuditLog{
 			UserID:     user.UserID,
 			ActionType: "LOGIN_FAILED_INVALID_SIGNATURE",
 			IPAddress:  "system",
 		})
-
 		return nil, errors.New("invalid cryptographic signature")
 	}
 
-	var boundDevice *models.UserDevice
-	deviceIDStr := strings.TrimSpace(req.DeviceID)
-
-	if deviceIDStr != "" {
-		deviceUUID, parseErr := uuid.Parse(deviceIDStr)
-		if parseErr != nil {
-			return nil, errors.New("invalid device_id")
-		}
-
-		dev, getErr := s.userRepo.GetDeviceByUserAndID(user.UserID, deviceUUID)
-		if getErr != nil {
-			if errors.Is(getErr, gorm.ErrRecordNotFound) {
-				return nil, errors.New("unknown device")
-			}
-			return nil, errors.New("failed to load device")
-		}
-
-		dev.FCMToken = req.FCMToken
-		dev.DeviceModel = req.DeviceModel
-		dev.LastActive = time.Now().UTC()
-
-		if updErr := s.userRepo.UpdateDeviceFields(dev); updErr != nil {
-			logger.Log.Error("failed to update device on login", zap.Error(updErr))
-			return nil, errors.New("failed to update device")
-		}
-		boundDevice = dev
-	} else {
-		dev := &models.UserDevice{
-			DeviceID:    uuid.New(),
-			UserID:      user.UserID,
-			FCMToken:    req.FCMToken,
-			DeviceModel: req.DeviceModel,
-			LastActive:  time.Now().UTC(),
-		}
-		if crtErr := s.userRepo.CreateDevice(dev); crtErr != nil {
-			logger.Log.Error("failed to create device on login", zap.Error(crtErr))
-			return nil, errors.New("failed to register device")
-		}
-		boundDevice = dev
-	}
-	tokenString, err := jwt.GenerateToken(user.UserID.String(), user.CoreGuardID, boundDevice.DeviceID.String())
+	// 6. Cihaz kaydı / güncelleme
+	boundDevice, err := s.resolveDevice(user, req)
 	if err != nil {
-		logger.Log.Error("failed to generate JWT token", zap.Error(err))
+		return nil, err
+	}
+
+	// 7. JWT üret
+	tokenString, err := jwt.GenerateToken(
+		user.UserID.String(),
+		user.CoreGuardID,
+		boundDevice.DeviceID.String(),
+	)
+	if err != nil {
+		logger.Log.Error("JWT generation failed", zap.Error(err))
 		return nil, errors.New("internal server error during token generation")
 	}
 
@@ -194,7 +311,10 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 		IPAddress:  "system",
 	})
 
-	logger.Log.Info("login verified successfully, JWT issued", zap.String("core_guard_id", req.CoreGuardID))
+	logger.Log.Info("login successful",
+		zap.String("core_guard_id", req.CoreGuardID),
+		zap.String("device_id", boundDevice.DeviceID.String()),
+	)
 
 	return &dto.LoginVerifyResponse{
 		AccessToken: tokenString,
@@ -204,6 +324,52 @@ func (s *authService) LoginVerify(req *dto.LoginVerifyRequest) (*dto.LoginVerify
 		Message:     "Welcome back! Cryptographic verification successful.",
 	}, nil
 }
+
+// resolveDevice — mevcut cihazı günceller veya yeni cihaz oluşturur
+func (s *authService) resolveDevice(user *models.User, req *dto.LoginVerifyRequest) (*models.UserDevice, error) {
+	deviceIDStr := strings.TrimSpace(req.DeviceID)
+
+	if deviceIDStr != "" {
+		deviceUUID, err := uuid.Parse(deviceIDStr)
+		if err != nil {
+			return nil, errors.New("invalid device_id format")
+		}
+
+		dev, err := s.userRepo.GetDeviceByUserAndID(user.UserID, deviceUUID)
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, errors.New("unknown device")
+			}
+			return nil, errors.New("failed to load device")
+		}
+
+		dev.FCMToken = req.FCMToken
+		dev.DeviceModel = req.DeviceModel
+		dev.LastActive = time.Now().UTC()
+
+		if err := s.userRepo.UpdateDeviceFields(dev); err != nil {
+			logger.Log.Error("device update failed", zap.Error(err))
+			return nil, errors.New("failed to update device")
+		}
+		return dev, nil
+	}
+
+	// Yeni cihaz
+	dev := &models.UserDevice{
+		DeviceID:    uuid.New(),
+		UserID:      user.UserID,
+		FCMToken:    req.FCMToken,
+		DeviceModel: req.DeviceModel,
+		LastActive:  time.Now().UTC(),
+	}
+	if err := s.userRepo.CreateDevice(dev); err != nil {
+		logger.Log.Error("device creation failed", zap.Error(err))
+		return nil, errors.New("failed to register device")
+	}
+	return dev, nil
+}
+
+// ── Yardımcı fonksiyonlar ────────────────────────────────────────────────────
 
 func generateCoreGuardID() string {
 	bytes := make([]byte, 4)
