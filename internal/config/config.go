@@ -30,8 +30,6 @@ type Config struct {
 	R2AccessKeyID  string
 	R2AccessSecret string
 	R2BucketName   string
-
-	GeminiAPIKey string
 }
 
 var AppConfig Config
@@ -62,8 +60,6 @@ func LoadConfig() {
 		R2AccessKeyID:  getEnv("R2_ACCESS_KEY_ID", ""),
 		R2AccessSecret: getEnv("R2_ACCESS_SECRET", ""),
 		R2BucketName:   getEnv("R2_BUCKET_NAME", ""),
-
-		GeminiAPIKey: getEnv("GEMINI_API_KEY", ""),
 	}
 
 	validateConfig()
