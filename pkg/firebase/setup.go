@@ -23,8 +23,7 @@ func InitFirebase() *firebase.App {
 	opt := option.WithCredentialsFile(credPath)
 	app, err := firebase.NewApp(context.Background(), nil, opt)
 	if err != nil {
-		logger.Log.Warn("Firebase failed to initialize — FCM push notifications disabled.",
-		)
+		logger.Log.Warn("Firebase failed to initialize — FCM push notifications disabled.")
 		return nil
 	}
 
