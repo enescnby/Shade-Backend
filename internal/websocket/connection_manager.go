@@ -90,22 +90,28 @@ type connectionManager struct {
 	mu         sync.RWMutex
 	msgRepo    repositories.MessageRepository
 	userRepo   repositories.UserRepository
+	groupRepo  repositories.GroupRepository
 	fcmService services.FCMService
 	rabbit     *rabbitmq.Client
+	bindingSvc services.GroupBindingService
 }
 
 func NewConnectionManager(
 	msgRepo repositories.MessageRepository,
 	userRepo repositories.UserRepository,
+	groupRepo repositories.GroupRepository,
 	fcmService services.FCMService,
 	rabbit *rabbitmq.Client,
+	bindingSvc services.GroupBindingService,
 ) ConnectionManager {
 	return &connectionManager{
 		clients:    make(map[string]*userState),
 		msgRepo:    msgRepo,
 		userRepo:   userRepo,
+		groupRepo:  groupRepo,
 		fcmService: fcmService,
 		rabbit:     rabbit,
+		bindingSvc: bindingSvc,
 	}
 }
 
@@ -122,17 +128,10 @@ func (m *connectionManager) userHasAnyOnlineSession(userID string) bool {
 }
 
 func (m *connectionManager) declareUserQueue(userID, deviceID string, ch *amqp.Channel) error {
-	queueName := rabbitmq.UserDeviceQueueName(userID, deviceID)
-	if _, err := ch.QueueDeclare(
-		queueName,
-		true,
-		false,
-		false,
-		false,
-		rabbitmq.UserQueueArgs(),
-	); err != nil {
+	if err := rabbitmq.DeclareUserDeviceQueue(ch, userID, deviceID); err != nil {
 		return err
 	}
+	queueName := rabbitmq.UserDeviceQueueName(userID, deviceID)
 	return ch.QueueBind(queueName, userID, rabbitmq.ExchangeUser, false, nil)
 }
 
@@ -165,6 +164,21 @@ func (m *connectionManager) Register(userID, deviceID string, conn *websocket.Co
 			_ = ch.Close()
 			_ = conn.Close()
 			return connID
+		}
+
+		// Yeni device queue declared. Kullanıcının üye olduğu tüm gruplara
+		// bağla — group exchange routing'inin hazır olması için.
+		if uid, errParse := uuid.Parse(userID); errParse == nil {
+			if did, errParseD := uuid.Parse(deviceID); errParseD == nil {
+				ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
+				if bErr := m.bindingSvc.BindDeviceToAllGroups(ctx, uid, did); bErr != nil {
+					logger.Log.Warn("register: bind device to groups failed",
+						zap.String("user_id", userID),
+						zap.String("device_id", deviceID),
+						zap.Error(bErr))
+				}
+				cancel()
+			}
 		}
 
 		us = &userState{
@@ -401,12 +415,35 @@ func (m *connectionManager) ReadPump(userID, deviceID, connID string, conn *webs
 			m.handlePayload(userID, deviceID, msg.Payload, rawPayload)
 		case *pb.WebSocketMessage_Receipt:
 			m.handleReceipt(userID, deviceID, msg.Receipt, rawPayload)
+		case *pb.WebSocketMessage_Gkd:
+			m.handleGroupKeyDistribution(userID, deviceID, msg.Gkd, rawPayload)
+		case *pb.WebSocketMessage_Gme:
+			// İstemci tarafından gönderilen GME drop edilir; üyelik event'lerinin
+			// tek meşru kaynağı sunucu (GroupEventPublisher). Aksi halde
+			// herhangi bir client sahte üyelik bildirimleri yayabilirdi.
+			logger.Log.Warn("client-published GroupMembershipEvent ignored",
+				zap.String("user_id", userID),
+				zap.String("device_id", deviceID))
 		}
 	}
 }
 
 func (m *connectionManager) handlePayload(senderID, senderDeviceID string, payload *pb.EncryptedPayload, rawPayload []byte) {
+	if payload.GroupId != "" {
+		m.handleGroupPayload(senderID, senderDeviceID, payload, rawPayload)
+		return
+	}
+	m.handleDirectPayload(senderID, senderDeviceID, payload, rawPayload)
+}
+
+func (m *connectionManager) handleDirectPayload(senderID, senderDeviceID string, payload *pb.EncryptedPayload, rawPayload []byte) {
 	receiverID := payload.ReceiverId
+	if receiverID == "" {
+		logger.Log.Warn("direct payload without receiver_id, dropping",
+			zap.String("user_id", senderID),
+			zap.String("msg_id", payload.MessageId))
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
 	publishErr := m.publishToUser(ctx, receiverID, rawPayload, "")
@@ -458,6 +495,54 @@ func (m *connectionManager) handlePayload(senderID, senderDeviceID string, paylo
 	}
 }
 
+func (m *connectionManager) handleGroupPayload(senderID, senderDeviceID string, payload *pb.EncryptedPayload, rawPayload []byte) {
+	groupID, err := uuid.Parse(payload.GroupId)
+	if err != nil {
+		logger.Log.Warn("group payload with invalid group_id, dropping",
+			zap.String("user_id", senderID),
+			zap.String("group_id", payload.GroupId))
+		return
+	}
+	senderUUID, err := uuid.Parse(senderID)
+	if err != nil {
+		return
+	}
+
+	// Authorization: gönderici gruba üye mi?
+	authzCtx, authzCancel := context.WithTimeout(context.Background(), userPublishTimeout)
+	if _, err := m.groupRepo.GetMember(authzCtx, groupID, senderUUID); err != nil {
+		authzCancel()
+		logger.Log.Warn("group payload from non-member, dropping",
+			zap.String("user_id", senderID),
+			zap.String("group_id", payload.GroupId),
+			zap.String("msg_id", payload.MessageId))
+		return
+	}
+	authzCancel()
+
+	// Tek publish — broker tüm bound queue'lara fan-out yapar.
+	ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
+	publishErr := m.publishToGroup(ctx, payload.GroupId, senderDeviceID, rawPayload)
+	cancel()
+
+	if publishErr != nil {
+		// Adım 6'da DB fallback ekleyeceğiz. Şimdilik sadece log.
+		logger.Log.Error("group publish failed",
+			zap.String("group_id", payload.GroupId),
+			zap.String("msg_id", payload.MessageId),
+			zap.Error(publishErr))
+		return
+	}
+
+	// FCM wake-up: offline üyelere push at, ama gönderenin kendisini atla.
+	m.wakeUpOfflineGroupMembers(groupID, senderUUID)
+
+	logger.Log.Info("group message published",
+		zap.String("group_id", payload.GroupId),
+		zap.String("sender_id", senderID),
+		zap.String("msg_id", payload.MessageId))
+}
+
 func (m *connectionManager) handleReceipt(senderID, senderDeviceID string, receipt *pb.DeliveryReceipt, rawPayload []byte) {
 	if receipt.Status == pb.ReceiptStatus_DELIVERED {
 		msgUUID, _ := uuid.Parse(receipt.MessageId)
@@ -505,6 +590,58 @@ func (m *connectionManager) handleReceipt(senderID, senderDeviceID string, recei
 	echoCancel()
 }
 
+// handleGroupKeyDistribution, istemcilerin grup için Sender Key Distribution
+// Message'larını birbirine ulaştırır. SKDM içeriği pairwise X25519+AEAD ile
+// alıcı için şifrelenmiştir (encrypted_skdm); sunucu içeriği görmüyor, sadece
+// doğru alıcıya route ediyor.
+//
+// Routing: shade.user direct exchange + routing_key = recipient_user_id.
+// Alıcı kullanıcının TÜM cihazları SKDM'yi alır; sadece hedef cihaz
+// decrypt edebilir (ECDH pairwise key cihaz public key'inden türetilir).
+// Bu yüzden recipient_device_id sadece istemci tarafı bir hint, server
+// device-bazlı routing yapmıyor.
+func (m *connectionManager) handleGroupKeyDistribution(senderID, senderDeviceID string, gkd *pb.GroupKeyDistribution, rawPayload []byte) {
+	// Impersonation koruması: WS session kimliği SKDM iddiasıyla eşleşmeli.
+	if gkd.SenderUserId != "" && gkd.SenderUserId != senderID {
+		logger.Log.Warn("SKDM with mismatched sender_user_id, dropping",
+			zap.String("ws_user_id", senderID),
+			zap.String("claim_user_id", gkd.SenderUserId),
+			zap.String("group_id", gkd.GroupId))
+		return
+	}
+	if gkd.SenderDeviceId != "" && gkd.SenderDeviceId != senderDeviceID {
+		logger.Log.Warn("SKDM with mismatched sender_device_id, dropping",
+			zap.String("ws_device_id", senderDeviceID),
+			zap.String("claim_device_id", gkd.SenderDeviceId),
+			zap.String("group_id", gkd.GroupId))
+		return
+	}
+	if gkd.RecipientUserId == "" {
+		logger.Log.Warn("SKDM with empty recipient_user_id, dropping",
+			zap.String("user_id", senderID),
+			zap.String("group_id", gkd.GroupId))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
+	defer cancel()
+
+	if err := m.publishToUser(ctx, gkd.RecipientUserId, rawPayload, ""); err != nil {
+		logger.Log.Warn("SKDM publish failed",
+			zap.String("group_id", gkd.GroupId),
+			zap.String("recipient_user_id", gkd.RecipientUserId),
+			zap.Error(err))
+		return
+	}
+
+	logger.Log.Info("SKDM forwarded",
+		zap.String("group_id", gkd.GroupId),
+		zap.String("sender_user_id", senderID),
+		zap.String("sender_device_id", senderDeviceID),
+		zap.String("recipient_user_id", gkd.RecipientUserId),
+		zap.String("recipient_device_id", gkd.RecipientDeviceId))
+}
+
 func (m *connectionManager) publishToUser(ctx context.Context, receiverID string, payload []byte, sourceConnID string) error {
 	ch, err := m.rabbit.Channel()
 	if err != nil {
@@ -530,6 +667,67 @@ func (m *connectionManager) publishToUser(ctx context.Context, receiverID string
 			Headers:      headers,
 		},
 	)
+}
+
+func (m *connectionManager) publishToGroup(ctx context.Context, groupID, sourceDeviceID string, payload []byte) error {
+	ch, err := m.rabbit.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	headers := amqp.Table{}
+	if sourceDeviceID != "" {
+		headers[headerSourceDeviceID] = sourceDeviceID
+	}
+
+	return ch.PublishWithContext(ctx,
+		rabbitmq.ExchangeGroup,
+		rabbitmq.GroupRoutingKey(groupID),
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  "application/octet-stream",
+			Body:         payload,
+			DeliveryMode: amqp.Persistent,
+			Timestamp:    time.Now(),
+			Headers:      headers,
+		},
+	)
+}
+
+func (m *connectionManager) wakeUpOfflineGroupMembers(groupID, senderUUID uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
+	defer cancel()
+
+	g, err := m.groupRepo.GetGroupByID(ctx, groupID)
+	if err != nil {
+		logger.Log.Warn("group FCM: get group failed",
+			zap.String("group_id", groupID.String()), zap.Error(err))
+		return
+	}
+
+	for _, member := range g.Members {
+		if member.UserID == senderUUID {
+			continue
+		}
+		memberIDStr := member.UserID.String()
+		if m.userHasAnyOnlineSession(memberIDStr) {
+			continue
+		}
+
+		devices, err := m.userRepo.ListDevicesByUserID(member.UserID)
+		if err != nil {
+			logger.Log.Warn("group FCM: list devices failed",
+				zap.String("user_id", memberIDStr), zap.Error(err))
+			continue
+		}
+		for _, d := range devices {
+			if d.FCMToken != "" {
+				_ = m.fcmService.SendWakeUpSignal(d.FCMToken)
+			}
+		}
+	}
 }
 
 func (m *connectionManager) Unregister(userID, deviceID, connID string) {

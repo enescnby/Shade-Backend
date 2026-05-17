@@ -4,12 +4,14 @@ import (
 	"core-backend/internal/models"
 	"core-backend/pkg/logger"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
 
 type AuditRepository interface {
 	LogEvent(audit *models.SecurityAuditLog) error
+	ListByUserID(userID uuid.UUID, limit int) ([]models.SecurityAuditLog, error)
 }
 
 type auditRepository struct {
@@ -26,4 +28,18 @@ func (r *auditRepository) LogEvent(audit *models.SecurityAuditLog) error {
 		return err
 	}
 	return nil
+}
+
+func (r *auditRepository) ListByUserID(userID uuid.UUID, limit int) ([]models.SecurityAuditLog, error) {
+	var rows []models.SecurityAuditLog
+	err := r.db.
+		Where("user_id = ?", userID).
+		Order("timestamp DESC").
+		Limit(limit).
+		Find(&rows).Error
+	if err != nil {
+		logger.Log.Error("failed to list security audit logs", zap.Error(err), zap.String("user_id", userID.String()))
+		return nil, err
+	}
+	return rows, nil
 }

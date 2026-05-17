@@ -81,14 +81,16 @@ func main() {
 	groupRepo := repositories.NewGroupRepository(database.DB)
 
 	authService := services.NewAuthService(userRepo, auditRepo)
-	keyService := services.NewKeyService(keyRepo)
+	keyService := services.NewKeyService(keyRepo, userRepo)
 	userService := services.NewUserService(userRepo)
 	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
 	messageService := services.NewMessageService(rabbitClient)
 	webSessionService := services.NewSessionService(webSessionRepo, userRepo)
-	groupService := services.NewGroupService(groupRepo, userRepo)
+	groupBindingService := services.NewGroupBindingService(rabbitClient, userRepo, groupRepo)
+	groupEventPublisher := services.NewGroupEventPublisher(rabbitClient)
+	groupService := services.NewGroupService(groupRepo, userRepo, groupBindingService, groupEventPublisher)
 
-	cm := websocket.NewConnectionManager(msgRepo, userRepo, firebaseService, rabbitClient)
+	cm := websocket.NewConnectionManager(msgRepo, userRepo, groupRepo, firebaseService, rabbitClient, groupBindingService)
 	wsHandler := handlers.NewWebSocketHandler(cm)
 	syncManager := websocket.NewSyncManager()
 

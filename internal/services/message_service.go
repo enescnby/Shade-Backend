@@ -75,13 +75,13 @@ func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.In
 				MessageID:   p.MessageId,
 				SenderID:    p.SenderId,
 				ReceiverID:  p.ReceiverId,
+				GroupID:     p.GroupId,
 				Ciphertext:  p.Ciphertext,
 				Nonce:       p.Nonce,
 				MessageType: int32(p.Type),
 				Timestamp:   delivery.Timestamp.Unix(),
 			})
-
-			if err := s.publishDeliveredReceipt(ch, p.MessageId, userID, p.SenderId); err != nil {
+			if err := s.publishDeliveredReceipt(ch, p.MessageId, userID, p.SenderId, p.GroupId); err != nil {
 				logger.Log.Warn("auto delivered receipt publish failed",
 					zap.String("user_id", userID),
 					zap.String("msg_id", p.MessageId), zap.Error(err))
@@ -93,6 +93,7 @@ func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.In
 				MessageID:  r.MessageId,
 				SenderID:   r.SenderId,
 				ReceiverID: r.ReceiverId,
+				GroupID:    r.GroupId,
 				Status:     r.Status.String(),
 				Timestamp:  delivery.Timestamp.Unix(),
 			})
@@ -109,13 +110,14 @@ func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.In
 	return response, nil
 }
 
-func (s *messageService) publishDeliveredReceipt(ch *amqp.Channel, msgID, fromUserID, toSenderID string) error {
+func (s *messageService) publishDeliveredReceipt(ch *amqp.Channel, msgID, fromUserID, toSenderID, groupID string) error {
 	receipt := &pb.WebSocketMessage{
 		Content: &pb.WebSocketMessage_Receipt{
 			Receipt: &pb.DeliveryReceipt{
 				MessageId:  msgID,
 				SenderId:   fromUserID,
 				ReceiverId: toSenderID,
+				GroupId:    groupID,
 				Status:     pb.ReceiptStatus_DELIVERED,
 				Timestamp:  time.Now().UnixMilli(),
 			},
