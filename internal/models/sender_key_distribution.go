@@ -20,9 +20,8 @@ type GroupSenderKeyDistribution struct {
 	RecipientUserID uuid.UUID `gorm:"type:uuid;primaryKey;index"`
 	GroupID         uuid.UUID `gorm:"type:uuid;primaryKey;index"`
 
-	KeyID          int64  `gorm:"not null"`
-	EncryptedSKDM  []byte `gorm:"not null"`
-	Nonce          []byte `gorm:"not null"`
+	EncryptedSKDM []byte `gorm:"not null"`
+	Nonce         []byte `gorm:"not null"`
 
 	UpdatedAt time.Time `gorm:"autoUpdateTime"`
 }
