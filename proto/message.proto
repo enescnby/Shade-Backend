@@ -18,6 +18,8 @@ message EncryptedPayload {
   string message_id = 1;
   string sender_id = 2;
   string sender_shade_id = 3;
+
+  //1-1 mesajlarda dolu, grup mesajlarında boş.
   string receiver_id = 4;
 
   bytes ciphertext = 5;
@@ -26,6 +28,13 @@ message EncryptedPayload {
 
   int64 timestamp = 8;
   MessageType type = 9;
+
+  string group_id = 10;
+  string sender_device_id = 11;
+  uint32 sender_key_id = 12;
+  uint64  chain_index = 13;
+
+  bytes signature = 14;
 }
 
 message DeliveryReceipt {
@@ -35,16 +44,6 @@ message DeliveryReceipt {
   string receiver_id = 4;
   ReceiptStatus status = 5;
   int64 timestamp = 6;
-}
 
-message MessageAck {
-  string message_id = 1;
-}
-
-message WebSocketMessage {
-  oneof content {
-    EncryptedPayload payload = 1;
-    DeliveryReceipt receipt = 2;
-    MessageAck ack = 3;
-  }
+  string group_id = 7;
 }

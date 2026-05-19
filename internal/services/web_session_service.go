@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"core-backend/internal/dto"
 	"core-backend/internal/models"
 	"core-backend/internal/repositories"
@@ -15,8 +16,9 @@ import (
 )
 
 const (
-	SessionTTL  = 120 * time.Second
-	LongPollMax = 25 * time.Second
+	SessionTTL           = 120 * time.Second
+	LongPollMax            = 25 * time.Second
+	webQueueProvisionTTL   = 5 * time.Second
 )
 
 var (
@@ -34,17 +36,23 @@ type WebSessionService interface {
 }
 
 type webSessionService struct {
-	repo     repositories.WebSessionRepository
-	userRepo repositories.UserRepository
-	mu       sync.Mutex
-	notifyCh map[string]chan struct{}
+	repo        repositories.WebSessionRepository
+	userRepo    repositories.UserRepository
+	bindingSvc  GroupBindingService
+	mu          sync.Mutex
+	notifyCh    map[string]chan struct{}
 }
 
-func NewSessionService(repo repositories.WebSessionRepository, userRepo repositories.UserRepository) WebSessionService {
+func NewSessionService(
+	repo repositories.WebSessionRepository,
+	userRepo repositories.UserRepository,
+	bindingSvc GroupBindingService,
+) WebSessionService {
 	return &webSessionService{
-		repo:     repo,
-		userRepo: userRepo,
-		notifyCh: make(map[string]chan struct{}),
+		repo:       repo,
+		userRepo:   userRepo,
+		bindingSvc: bindingSvc,
+		notifyCh:   make(map[string]chan struct{}),
 	}
 }
 
@@ -157,6 +165,14 @@ func (s *webSessionService) AuthorizeSession(userID uuid.UUID, sessionID string,
 		logger.Log.Error("failed to create web device", zap.Error(err))
 		return err
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), webQueueProvisionTTL)
+	if err := s.bindingSvc.ProvisionDeviceQueue(ctx, userID, webDev.DeviceID); err != nil {
+		cancel()
+		logger.Log.Error("failed to provision web device queue", zap.Error(err))
+		return err
+	}
+	cancel()
 
 	if err := s.repo.Authorize(id, req.Ciphertext, req.Nonce, req.AndroidX25519Pub, userID, webDev.DeviceID); err != nil {
 		return err

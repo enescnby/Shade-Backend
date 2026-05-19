@@ -5,10 +5,13 @@ import (
 	"core-backend/internal/dto"
 	"core-backend/internal/models"
 	"core-backend/internal/repositories"
+	"core-backend/pb"
+	"core-backend/pkg/logger"
 	"errors"
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
 
@@ -29,12 +32,51 @@ type GroupService interface {
 }
 
 type groupService struct {
-	groupRepo repositories.GroupRepository
-	userRepo  repositories.UserRepository
+	groupRepo  repositories.GroupRepository
+	userRepo   repositories.UserRepository
+	bindingSvc GroupBindingService
+	eventPub   GroupEventPublisher
 }
 
-func NewGroupService(groupRepo repositories.GroupRepository, userRepo repositories.UserRepository) GroupService {
-	return &groupService{groupRepo: groupRepo, userRepo: userRepo}
+func NewGroupService(
+	groupRepo repositories.GroupRepository,
+	userRepo repositories.UserRepository,
+	bindingSvc GroupBindingService,
+	eventPub GroupEventPublisher,
+) GroupService {
+	return &groupService{
+		groupRepo:  groupRepo,
+		userRepo:   userRepo,
+		bindingSvc: bindingSvc,
+		eventPub:   eventPub,
+	}
+}
+
+// publishJoined, üye eklendiğinde JOINED event'ini gruba yayınlar.
+// Hata loglanır ama caller'a dönmez (event yayını kullanıcı isteğini
+// fail etmemeli).
+func (s *groupService) publishJoined(ctx context.Context, groupID, actorID, subjectID uuid.UUID) {
+	_ = s.eventPub.PublishMembershipEvent(ctx, &pb.GroupMembershipEvent{
+		GroupId:   groupID.String(),
+		Kind:      pb.GroupMembershipEvent_JOINED,
+		ActorId:   actorID.String(),
+		SubjectId: subjectID.String(),
+	})
+}
+
+// publishExit, üye çıkarıldığında veya ayrıldığında ilgili event'i yayınlar.
+// actorID == subjectID ise LEFT (öz-ayrılma), aksi halde REMOVED.
+func (s *groupService) publishExit(ctx context.Context, groupID, actorID, subjectID uuid.UUID) {
+	kind := pb.GroupMembershipEvent_REMOVED
+	if actorID == subjectID {
+		kind = pb.GroupMembershipEvent_LEFT
+	}
+	_ = s.eventPub.PublishMembershipEvent(ctx, &pb.GroupMembershipEvent{
+		GroupId:   groupID.String(),
+		Kind:      kind,
+		ActorId:   actorID.String(),
+		SubjectId: subjectID.String(),
+	})
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -73,7 +115,6 @@ func (s *groupService) CreateGroup(ctx context.Context, ownerID uuid.UUID, owner
 		return nil, err
 	}
 
-	// Add owner as first member
 	if err := s.groupRepo.AddMember(ctx, &models.GroupMember{
 		GroupID: g.GroupID,
 		UserID:  ownerID,
@@ -83,7 +124,15 @@ func (s *groupService) CreateGroup(ctx context.Context, ownerID uuid.UUID, owner
 		return nil, err
 	}
 
-	// Add additional members provided at creation time
+	// Owner bağlanır. Hata olursa request'i fail etmiyoruz; cihaz reconnect
+	// ettiğinde BindDeviceToAllGroups eksik binding'i yakalar.
+	if err := s.bindingSvc.BindUserToGroup(ctx, g.GroupID, ownerID); err != nil {
+		logger.Log.Warn("create group: bind owner failed",
+			zap.String("user_id", ownerID.String()),
+			zap.String("group_id", g.GroupID.String()),
+			zap.Error(err))
+	}
+
 	for _, idStr := range req.MemberIDs {
 		uid, err := uuid.Parse(idStr)
 		if err != nil {
@@ -91,17 +140,26 @@ func (s *groupService) CreateGroup(ctx context.Context, ownerID uuid.UUID, owner
 		}
 		user, err := s.userRepo.GetUserByID(uid)
 		if err != nil {
-			continue // skip unknown users
+			continue
 		}
-		_ = s.groupRepo.AddMember(ctx, &models.GroupMember{
+		if err := s.groupRepo.AddMember(ctx, &models.GroupMember{
 			GroupID: g.GroupID,
 			UserID:  uid,
 			ShadeID: user.CoreGuardID,
 			Role:    "member",
-		})
+		}); err != nil {
+			continue
+		}
+		if err := s.bindingSvc.BindUserToGroup(ctx, g.GroupID, uid); err != nil {
+			logger.Log.Warn("create group: bind member failed",
+				zap.String("user_id", uid.String()),
+				zap.String("group_id", g.GroupID.String()),
+				zap.Error(err))
+		}
+
+		s.publishJoined(ctx, g.GroupID, ownerID, uid)
 	}
 
-	// Reload to pick up all members
 	full, err := s.groupRepo.GetGroupByID(ctx, g.GroupID)
 	if err != nil {
 		return nil, err
@@ -141,13 +199,20 @@ func (s *groupService) DeleteGroup(ctx context.Context, groupID, callerID uuid.U
 	if g.OwnerID != callerID {
 		return errors.New("only the owner can delete the group")
 	}
+
+	// UnbindAllFromGroup üye listesi DB'den okuyor; o yüzden DELETE'ten ÖNCE.
+	if err := s.bindingSvc.UnbindAllFromGroup(ctx, groupID); err != nil {
+		logger.Log.Warn("delete group: unbind-all failed",
+			zap.String("group_id", groupID.String()),
+			zap.Error(err))
+	}
+
 	return s.groupRepo.DeleteGroup(ctx, groupID)
 }
 
 // ── Members ───────────────────────────────────────────────────────────────────
 
 func (s *groupService) AddMember(ctx context.Context, groupID, callerID uuid.UUID, req dto.AddMemberRequest) error {
-	// Only existing members (or owner) can add new members
 	if _, err := s.groupRepo.GetMember(ctx, groupID, callerID); err != nil {
 		return errors.New("not a member of the group")
 	}
@@ -159,12 +224,24 @@ func (s *groupService) AddMember(ctx context.Context, groupID, callerID uuid.UUI
 	if err != nil {
 		return errors.New("user not found")
 	}
-	return s.groupRepo.AddMember(ctx, &models.GroupMember{
+	if err := s.groupRepo.AddMember(ctx, &models.GroupMember{
 		GroupID: groupID,
 		UserID:  uid,
 		ShadeID: user.CoreGuardID,
 		Role:    "member",
-	})
+	}); err != nil {
+		return err
+	}
+
+	if err := s.bindingSvc.BindUserToGroup(ctx, groupID, uid); err != nil {
+		logger.Log.Warn("add member: bind failed",
+			zap.String("user_id", uid.String()),
+			zap.String("group_id", groupID.String()),
+			zap.Error(err))
+	}
+
+	s.publishJoined(ctx, groupID, callerID, uid)
+	return nil
 }
 
 func (s *groupService) RemoveMember(ctx context.Context, groupID, callerID, targetID uuid.UUID) error {
@@ -172,10 +249,22 @@ func (s *groupService) RemoveMember(ctx context.Context, groupID, callerID, targ
 	if err != nil {
 		return err
 	}
-	// Owner can remove anyone; members can only remove themselves
 	if g.OwnerID != callerID && callerID != targetID {
 		return errors.New("not authorised to remove this member")
 	}
+
+	// Event'i unbind'den ÖNCE yayınla; subject (çıkarılan üye) hâlâ
+	// bound durumda olduğu için kendi LEFT/REMOVED bildirimini görür.
+	s.publishExit(ctx, groupID, callerID, targetID)
+
+	// Sonra broker'dan kopar ki çıkarılan üye yeni mesaj almasın.
+	if err := s.bindingSvc.UnbindUserFromGroup(ctx, groupID, targetID); err != nil {
+		logger.Log.Warn("remove member: unbind failed",
+			zap.String("user_id", targetID.String()),
+			zap.String("group_id", groupID.String()),
+			zap.Error(err))
+	}
+
 	return s.groupRepo.RemoveMember(ctx, groupID, targetID)
 }
 
@@ -248,12 +337,21 @@ func (s *groupService) RedeemInvite(ctx context.Context, code string, callerID u
 
 	if inv.GroupID != nil {
 		// Group invite — add caller to the group
-		_ = s.groupRepo.AddMember(ctx, &models.GroupMember{
+		if err := s.groupRepo.AddMember(ctx, &models.GroupMember{
 			GroupID: *inv.GroupID,
 			UserID:  callerID,
 			ShadeID: callerShadeID,
 			Role:    "member",
-		})
+		}); err == nil {
+			if bErr := s.bindingSvc.BindUserToGroup(ctx, *inv.GroupID, callerID); bErr != nil {
+				logger.Log.Warn("redeem invite: bind failed",
+					zap.String("user_id", callerID.String()),
+					zap.String("group_id", inv.GroupID.String()),
+					zap.Error(bErr))
+			}
+			// Self-join via invite: actor == subject == callerID.
+			s.publishJoined(ctx, *inv.GroupID, callerID, callerID)
+		}
 		g, err := s.groupRepo.GetGroupByID(ctx, *inv.GroupID)
 		if err != nil {
 			return nil, err

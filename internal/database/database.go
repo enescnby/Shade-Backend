@@ -60,6 +60,7 @@ func Migrate() {
 		&models.Group{},
 		&models.GroupMember{},
 		&models.ContactInvite{},
+		&models.GroupSenderKeyDistribution{},
 	)
 
 	if err != nil {
