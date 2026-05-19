@@ -2,15 +2,17 @@ package services
 
 import (
 	"context"
+	"encoding/base64"
+	"time"
+
 	"core-backend/internal/dto"
 	"core-backend/internal/rabbitmq"
 	"core-backend/internal/repositories"
 	"core-backend/pb"
 	"core-backend/pkg/logger"
-	"time"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
@@ -30,12 +32,24 @@ type MessageService interface {
 }
 
 type messageService struct {
-	rabbit  *rabbitmq.Client
-	msgRepo repositories.MessageRepository
+	rabbit     *rabbitmq.Client
+	bindingSvc GroupBindingService
+	skdmRepo   repositories.SenderKeyDistributionRepository
+	msgRepo    repositories.MessageRepository
 }
 
-func NewMessageService(rabbit *rabbitmq.Client, msgRepo repositories.MessageRepository) MessageService {
-	return &messageService{rabbit: rabbit, msgRepo: msgRepo}
+func NewMessageService(
+	rabbit *rabbitmq.Client,
+	bindingSvc GroupBindingService,
+	skdmRepo repositories.SenderKeyDistributionRepository,
+	msgRepo repositories.MessageRepository,
+) MessageService {
+	return &messageService{
+		rabbit:     rabbit,
+		bindingSvc: bindingSvc,
+		skdmRepo:   skdmRepo,
+		msgRepo:    msgRepo,
+	}
 }
 
 func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.InboxResponse, error) {
@@ -46,16 +60,36 @@ func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.In
 		limit = maxDrainLimit
 	}
 
+	uid, err := uuid.Parse(userID)
+	if err != nil {
+		return nil, err
+	}
+	did, err := uuid.Parse(deviceID)
+	if err != nil {
+		return nil, err
+	}
+
+	provisionCtx, provisionCancel := context.WithTimeout(context.Background(), receiptPublishTTL)
+	if err := s.bindingSvc.ProvisionDeviceQueue(provisionCtx, uid, did); err != nil {
+		provisionCancel()
+		return nil, err
+	}
+	provisionCancel()
+
 	ch, err := s.rabbit.Channel()
 	if err != nil {
 		return nil, err
 	}
 	defer ch.Close()
 
+	// Kalıcı SKDM kayıtlarını queue'ya geri yayınla. Bu çağrı, kuyruk
+	// oluşmadan ÖNCE yayınlanmış SKDM'lerin (RabbitMQ tarafından drop edilen)
+	// yeni cihazlarda da geçerli olmasını sağlar.
+	s.republishStoredSKDMs(ch, uid)
+
 	queueName := rabbitmq.UserDeviceQueueName(userID, deviceID)
 	response := &dto.InboxResponse{
-		Messages: []dto.InboxMessage{},
-		Receipts: []dto.InboxReceipt{},
+		Items: []dto.InboxItem{},
 	}
 
 	for i := 0; i < limit; i++ {
@@ -75,51 +109,46 @@ func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.In
 			continue
 		}
 
-		switch content := wrapper.Content.(type) {
-		case *pb.WebSocketMessage_Payload:
-			p := content.Payload
-			response.Messages = append(response.Messages, dto.InboxMessage{
-				MessageID:   p.MessageId,
-				SenderID:    p.SenderId,
-				ReceiverID:  p.ReceiverId,
-				GroupID:     p.GroupId,
-				Ciphertext:  p.Ciphertext,
-				Nonce:       p.Nonce,
-				MessageType: int32(p.Type),
-				Timestamp:   delivery.Timestamp.Unix(),
-			})
+		response.Items = append(response.Items, dto.InboxItem{
+			Data: base64.StdEncoding.EncodeToString(delivery.Body),
+		})
+
+		if payload, ok := wrapper.Content.(*pb.WebSocketMessage_Payload); ok {
+			p := payload.Payload
 			if err := s.publishDeliveredReceipt(ch, p.MessageId, userID, p.SenderId, p.GroupId); err != nil {
 				logger.Log.Warn("auto delivered receipt publish failed",
 					zap.String("user_id", userID),
 					zap.String("msg_id", p.MessageId), zap.Error(err))
 			}
-
-		case *pb.WebSocketMessage_Receipt:
-			r := content.Receipt
-			response.Receipts = append(response.Receipts, dto.InboxReceipt{
-				MessageID:  r.MessageId,
-				SenderID:   r.SenderId,
-				ReceiverID: r.ReceiverId,
-				GroupID:    r.GroupId,
-				Status:     r.Status.String(),
-				Timestamp:  delivery.Timestamp.Unix(),
-			})
 		}
 
 		_ = delivery.Ack(false)
 	}
 
+	response.Count = len(response.Items)
+
+	if response.Count == limit {
+		peek, ok, err := ch.Get(queueName, false)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			response.HasMore = true
+			_ = peek.Nack(false, true)
+		}
+	}
+
 	logger.Log.Info("inbox drained",
 		zap.String("user_id", userID),
-		zap.Int("messages", len(response.Messages)),
-		zap.Int("receipts", len(response.Receipts)))
+		zap.Int("items", response.Count),
+		zap.Bool("has_more", response.HasMore))
 
 	return response, nil
 }
 
 // SendReceipts — her makbuz için orijinal mesaj sahibine receipt iletir.
 func (s *messageService) SendReceipts(ctx context.Context, fromUserID, fromShadeID string, receipts []dto.ReceiptRequest) error {
-	if len(receipts) == 0 {
+	if len(receipts) == 0 || s.msgRepo == nil {
 		return nil
 	}
 
@@ -128,7 +157,6 @@ func (s *messageService) SendReceipts(ctx context.Context, fromUserID, fromShade
 		return err
 	}
 
-	// Tüm messageId'leri parse et
 	var msgUUIDs []uuid.UUID
 	validReceipts := make([]dto.ReceiptRequest, 0, len(receipts))
 	for _, r := range receipts {
@@ -143,14 +171,12 @@ func (s *messageService) SendReceipts(ctx context.Context, fromUserID, fromShade
 		return nil
 	}
 
-	// Orijinal mesajları DB'den çek — sender_id'yi bulmak için
 	msgs, err := s.msgRepo.GetMessagesByIDsForReceiver(ctx, receiverUUID, msgUUIDs)
 	if err != nil {
 		logger.Log.Warn("SendReceipts: DB lookup failed", zap.Error(err))
 		return nil // best-effort
 	}
 
-	// messageId → senderID haritası
 	senderMap := make(map[string]string, len(msgs))
 	for _, m := range msgs {
 		senderMap[m.MessageID.String()] = m.SenderID.String()
@@ -165,7 +191,7 @@ func (s *messageService) SendReceipts(ctx context.Context, fromUserID, fromShade
 	for _, r := range validReceipts {
 		originalSenderID, ok := senderMap[r.MessageID]
 		if !ok {
-			// Mesaj DB'de bulunamadı (grup mesajı veya eski kayıt) — atla
+			// Grup mesajlarında veya artık mevcut olmayan kayıtlarda atla.
 			continue
 		}
 
@@ -196,7 +222,7 @@ func (s *messageService) SendReceipts(ctx context.Context, fromUserID, fromShade
 		pubCtx, cancel := context.WithTimeout(ctx, receiptPublishTTL)
 		err = ch.PublishWithContext(pubCtx,
 			rabbitmq.ExchangeUser,
-			originalSenderID, // routing key = orijinal gönderen
+			originalSenderID,
 			false,
 			false,
 			amqp.Publishing{
@@ -217,6 +243,73 @@ func (s *messageService) SendReceipts(ctx context.Context, fromUserID, fromShade
 	}
 
 	return nil
+}
+
+// republishStoredSKDMs, alıcı için kayıtlı her SKDM'i (sender_user, sender_device,
+// group) başına bir GKD frame'i olarak yeniden inşa edip ExchangeUser'a
+// yayınlar — kuyruktaki sıraya eklenir, normal inbox drain ile servis edilir.
+//
+// Hata olursa loglar; replay best-effort'tür ve inbox drain'i bloklamaz.
+func (s *messageService) republishStoredSKDMs(ch *amqp.Channel, recipientUUID uuid.UUID) {
+	if s.skdmRepo == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), receiptPublishTTL)
+	rows, err := s.skdmRepo.ListForRecipient(ctx, recipientUUID)
+	cancel()
+	if err != nil {
+		logger.Log.Warn("SKDM replay list failed",
+			zap.String("recipient_user_id", recipientUUID.String()), zap.Error(err))
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+
+	recipientStr := recipientUUID.String()
+	for _, row := range rows {
+		frame := &pb.WebSocketMessage{
+			Content: &pb.WebSocketMessage_Gkd{
+				Gkd: &pb.GroupKeyDistribution{
+					GroupId:         row.GroupID.String(),
+					SenderUserId:    row.SenderUserID.String(),
+					SenderDeviceId:  row.SenderDeviceID.String(),
+					RecipientUserId: recipientStr,
+					EncryptedSkdm:   row.EncryptedSKDM,
+					Nonce:           row.Nonce,
+				},
+			},
+		}
+		body, err := proto.Marshal(frame)
+		if err != nil {
+			logger.Log.Warn("SKDM replay marshal failed",
+				zap.String("group_id", row.GroupID.String()), zap.Error(err))
+			continue
+		}
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), receiptPublishTTL)
+		if err := ch.PublishWithContext(pubCtx,
+			rabbitmq.ExchangeUser,
+			recipientStr,
+			false,
+			false,
+			amqp.Publishing{
+				ContentType:  "application/octet-stream",
+				Body:         body,
+				DeliveryMode: amqp.Persistent,
+				Timestamp:    time.Now(),
+			},
+		); err != nil {
+			logger.Log.Warn("SKDM replay publish failed",
+				zap.String("recipient_user_id", recipientStr),
+				zap.String("group_id", row.GroupID.String()),
+				zap.Error(err))
+		}
+		pubCancel()
+	}
+
+	logger.Log.Info("SKDM replay published",
+		zap.String("recipient_user_id", recipientStr),
+		zap.Int("count", len(rows)))
 }
 
 func (s *messageService) publishDeliveredReceipt(ch *amqp.Channel, msgID, fromUserID, toSenderID, groupID string) error {
