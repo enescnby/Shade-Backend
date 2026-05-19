@@ -44,7 +44,7 @@ func (r *senderKeyDistributionRepository) Upsert(ctx context.Context, row *model
 				{Name: "group_id"},
 			},
 			DoUpdates: clause.AssignmentColumns([]string{
-				"key_id", "encrypted_skdm", "nonce", "updated_at",
+				"encrypted_skdm", "nonce", "updated_at",
 			}),
 		}).
 		Create(row).Error
