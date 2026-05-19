@@ -7,8 +7,8 @@ import (
 	"core-backend/pkg/logger"
 	"errors"
 
-	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/google/uuid"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
 )
 
@@ -57,7 +57,7 @@ func (s *groupBindingService) ProvisionDeviceQueue(ctx context.Context, userID, 
 		return err
 	}
 
-	if err := s.bindDeviceToAllGroups(ch, userID, deviceID); err != nil {
+	if err := s.bindDeviceToAllGroups(ctx, ch, userID, deviceID); err != nil {
 		return err
 	}
 
@@ -156,11 +156,11 @@ func (s *groupBindingService) BindDeviceToAllGroups(ctx context.Context, userID,
 		return err
 	}
 	defer ch.Close()
-	return s.bindDeviceToAllGroups(ch, userID, deviceID)
+	return s.bindDeviceToAllGroups(ctx, ch, userID, deviceID)
 }
 
-func (s *groupBindingService) bindDeviceToAllGroups(ch *amqp.Channel, userID, deviceID uuid.UUID) error {
-	groups, err := s.groupRepo.ListGroupsForUser(context.Background(), userID)
+func (s *groupBindingService) bindDeviceToAllGroups(ctx context.Context, ch *amqp.Channel, userID, deviceID uuid.UUID) error {
+	groups, err := s.groupRepo.ListGroupsForUser(ctx, userID)
 	if err != nil {
 		return err
 	}

@@ -40,15 +40,19 @@ var (
 	}
 
 	// Medya yükleme — bant genişliği koruması
+	// Dev: 3 emülatör + profil fotoğrafı indirmeleri → 300/dk (~100/cihaz).
+	// Prod'da bu değeri 60'a düşür.
 	MediaLimitConfig = RateLimitConfig{
-		Limit:  20,
+		Limit:  300,
 		Window: time.Minute,
 		Name:   "media",
 	}
 
 	// Genel API — authenticated endpoint'ler
+	// Dev: 3 emülatör aynı 127.0.0.1 IP'sini paylaşır → 600/dk (~200/cihaz).
+	// Prod'da bu değeri 120'ye düşür veya per-user limitleme kullan.
 	APILimitConfig = RateLimitConfig{
-		Limit:  120,
+		Limit:  600,
 		Window: time.Minute,
 		Name:   "api",
 	}

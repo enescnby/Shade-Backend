@@ -21,6 +21,8 @@ type UserRepository interface {
 	GetDeviceByUserAndID(userID, deviceID uuid.UUID) (*models.UserDevice, error)
 	UpdateDeviceFields(device *models.UserDevice) error
 	ListDevicesByUserID(userID uuid.UUID) ([]models.UserDevice, error)
+	UpdateDisplayName(ctx context.Context, userID uuid.UUID, displayName string) error
+	UpdateProfileImage(ctx context.Context, userID uuid.UUID, imageID *uuid.UUID) error
 }
 
 type userRepository struct {
@@ -145,4 +147,29 @@ func (r *userRepository) ListDevicesByUserID(userID uuid.UUID) ([]models.UserDev
 		return nil, err
 	}
 	return devices, nil
+}
+
+func (r *userRepository) UpdateDisplayName(ctx context.Context, userID uuid.UUID, displayName string) error {
+	res := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("display_name", displayName)
+	if res.Error != nil {
+		logger.Log.Error("failed to update display name", zap.Error(res.Error))
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+func (r *userRepository) UpdateProfileImage(ctx context.Context, userID uuid.UUID, imageID *uuid.UUID) error {
+	res := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("profile_image_id", imageID)
+	if res.Error != nil {
+		logger.Log.Error("failed to update profile image", zap.Error(res.Error))
+		return res.Error
+	}
+	return nil
 }

@@ -64,6 +64,12 @@ func (m *mockUserRepo) ListDevicesByUserID(userID uuid.UUID) ([]models.UserDevic
 	args := m.Called(userID)
 	return args.Get(0).([]models.UserDevice), args.Error(1)
 }
+func (m *mockUserRepo) UpdateDisplayName(ctx context.Context, userID uuid.UUID, displayName string) error {
+	return m.Called(ctx, userID, displayName).Error(0)
+}
+func (m *mockUserRepo) UpdateProfileImage(ctx context.Context, userID uuid.UUID, imageID *uuid.UUID) error {
+	return m.Called(ctx, userID, imageID).Error(0)
+}
 
 // ── Mock: AuditRepository ─────────────────────────────────────────────────────
 
@@ -71,6 +77,13 @@ type mockAuditRepo struct{ mock.Mock }
 
 func (m *mockAuditRepo) LogEvent(log *models.SecurityAuditLog) error {
 	return m.Called(log).Error(0)
+}
+func (m *mockAuditRepo) ListByUserID(userID uuid.UUID, limit int) ([]models.SecurityAuditLog, error) {
+	args := m.Called(userID, limit)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).([]models.SecurityAuditLog), args.Error(1)
 }
 
 // ── Yardımcılar ───────────────────────────────────────────────────────────────
