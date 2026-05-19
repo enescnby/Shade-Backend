@@ -79,18 +79,19 @@ func main() {
 	mediaRepo := repositories.NewMediaRepository(database.DB, r2Client, config.AppConfig.R2BucketName)
 	webSessionRepo := repositories.NewWebSessionRepository(database.DB)
 	groupRepo := repositories.NewGroupRepository(database.DB)
+	skdmRepo := repositories.NewSenderKeyDistributionRepository(database.DB)
 
 	authService := services.NewAuthService(userRepo, auditRepo)
 	keyService := services.NewKeyService(keyRepo, userRepo)
 	userService := services.NewUserService(userRepo)
 	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
-	messageService := services.NewMessageService(rabbitClient)
-	webSessionService := services.NewSessionService(webSessionRepo, userRepo)
 	groupBindingService := services.NewGroupBindingService(rabbitClient, userRepo, groupRepo)
+	messageService := services.NewMessageService(rabbitClient, groupBindingService, skdmRepo)
+	webSessionService := services.NewSessionService(webSessionRepo, userRepo, groupBindingService)
 	groupEventPublisher := services.NewGroupEventPublisher(rabbitClient)
 	groupService := services.NewGroupService(groupRepo, userRepo, groupBindingService, groupEventPublisher)
 
-	cm := websocket.NewConnectionManager(msgRepo, userRepo, groupRepo, firebaseService, rabbitClient, groupBindingService)
+	cm := websocket.NewConnectionManager(msgRepo, userRepo, groupRepo, skdmRepo, firebaseService, rabbitClient, groupBindingService)
 	wsHandler := handlers.NewWebSocketHandler(cm)
 	syncManager := websocket.NewSyncManager()
 

@@ -1,26 +1,13 @@
 package dto
 
-type InboxMessage struct {
-	MessageID   string `json:"message_id"`
-	SenderID    string `json:"sender_id"`
-	ReceiverID  string `json:"receiver_id,omitempty"`
-	GroupID     string `json:"group_id,omitempty"`
-	Ciphertext  []byte `json:"ciphertext"`
-	Nonce       []byte `json:"nonce"`
-	MessageType int32  `json:"message_type"`
-	Timestamp   int64  `json:"timestamp"`
-}
-
-type InboxReceipt struct {
-	MessageID  string `json:"message_id"`
-	SenderID   string `json:"sender_id"`
-	ReceiverID string `json:"receiver_id"`
-	GroupID    string `json:"group_id,omitempty"`
-	Status     string `json:"status"`
-	Timestamp  int64  `json:"timestamp"`
+// InboxItem is a queued WebSocketMessage envelope, base64-encoded protobuf.
+// Clients should decode and unmarshal into pb.WebSocketMessage — same as WS binary frames.
+type InboxItem struct {
+	Data string `json:"data"`
 }
 
 type InboxResponse struct {
-	Messages []InboxMessage `json:"messages"`
-	Receipts []InboxReceipt `json:"receipts"`
+	Items   []InboxItem `json:"items"`
+	Count   int         `json:"count"`
+	HasMore bool        `json:"has_more"`
 }

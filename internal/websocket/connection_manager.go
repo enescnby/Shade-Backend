@@ -91,6 +91,7 @@ type connectionManager struct {
 	msgRepo    repositories.MessageRepository
 	userRepo   repositories.UserRepository
 	groupRepo  repositories.GroupRepository
+	skdmRepo   repositories.SenderKeyDistributionRepository
 	fcmService services.FCMService
 	rabbit     *rabbitmq.Client
 	bindingSvc services.GroupBindingService
@@ -100,6 +101,7 @@ func NewConnectionManager(
 	msgRepo repositories.MessageRepository,
 	userRepo repositories.UserRepository,
 	groupRepo repositories.GroupRepository,
+	skdmRepo repositories.SenderKeyDistributionRepository,
 	fcmService services.FCMService,
 	rabbit *rabbitmq.Client,
 	bindingSvc services.GroupBindingService,
@@ -109,6 +111,7 @@ func NewConnectionManager(
 		msgRepo:    msgRepo,
 		userRepo:   userRepo,
 		groupRepo:  groupRepo,
+		skdmRepo:   skdmRepo,
 		fcmService: fcmService,
 		rabbit:     rabbit,
 		bindingSvc: bindingSvc,
@@ -127,14 +130,6 @@ func (m *connectionManager) userHasAnyOnlineSession(userID string) bool {
 	return false
 }
 
-func (m *connectionManager) declareUserQueue(userID, deviceID string, ch *amqp.Channel) error {
-	if err := rabbitmq.DeclareUserDeviceQueue(ch, userID, deviceID); err != nil {
-		return err
-	}
-	queueName := rabbitmq.UserDeviceQueueName(userID, deviceID)
-	return ch.QueueBind(queueName, userID, rabbitmq.ExchangeUser, false, nil)
-}
-
 func (m *connectionManager) Register(userID, deviceID string, conn *websocket.Conn) string {
 	connID := uuid.NewString()
 	cs := &connState{connID: connID, conn: conn}
@@ -144,6 +139,30 @@ func (m *connectionManager) Register(userID, deviceID string, conn *websocket.Co
 	m.mu.Lock()
 	us, ok := m.clients[key]
 	if !ok {
+		uid, errParse := uuid.Parse(userID)
+		did, errParseD := uuid.Parse(deviceID)
+		if errParse != nil || errParseD != nil {
+			m.mu.Unlock()
+			logger.Log.Error("user register: invalid ids",
+				zap.String("user_id", userID),
+				zap.String("device_id", deviceID))
+			_ = conn.Close()
+			return connID
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
+		if err := m.bindingSvc.ProvisionDeviceQueue(ctx, uid, did); err != nil {
+			cancel()
+			m.mu.Unlock()
+			logger.Log.Error("user queue provision failed",
+				zap.String("user_id", userID),
+				zap.String("device_id", deviceID),
+				zap.Error(err))
+			_ = conn.Close()
+			return connID
+		}
+		cancel()
+
 		ch, err := m.rabbit.Channel()
 		if err != nil {
 			m.mu.Unlock()
@@ -153,32 +172,6 @@ func (m *connectionManager) Register(userID, deviceID string, conn *websocket.Co
 				zap.Error(err))
 			_ = conn.Close()
 			return connID
-		}
-
-		if err := m.declareUserQueue(userID, deviceID, ch); err != nil {
-			m.mu.Unlock()
-			logger.Log.Error("user queue declare failed",
-				zap.String("user_id", userID),
-				zap.String("device_id", deviceID),
-				zap.Error(err))
-			_ = ch.Close()
-			_ = conn.Close()
-			return connID
-		}
-
-		// Yeni device queue declared. Kullanıcının üye olduğu tüm gruplara
-		// bağla — group exchange routing'inin hazır olması için.
-		if uid, errParse := uuid.Parse(userID); errParse == nil {
-			if did, errParseD := uuid.Parse(deviceID); errParseD == nil {
-				ctx, cancel := context.WithTimeout(context.Background(), userPublishTimeout)
-				if bErr := m.bindingSvc.BindDeviceToAllGroups(ctx, uid, did); bErr != nil {
-					logger.Log.Warn("register: bind device to groups failed",
-						zap.String("user_id", userID),
-						zap.String("device_id", deviceID),
-						zap.Error(bErr))
-				}
-				cancel()
-			}
 		}
 
 		us = &userState{
@@ -534,6 +527,17 @@ func (m *connectionManager) handleGroupPayload(senderID, senderDeviceID string, 
 		return
 	}
 
+	// Göndericinin diğer cihazları: 1-1 ile aynı multi-device echo (shade.user).
+	// Kuyruk zaten group bind ile mesajı alıyorsa istemci message_id ile tekilleştirmeli.
+	echoCtx, echoCancel := context.WithTimeout(context.Background(), userPublishTimeout)
+	if echoErr := m.publishToUser(echoCtx, senderID, rawPayload, senderDeviceID); echoErr != nil {
+		logger.Log.Warn("multi-device echo publish failed",
+			zap.String("user_id", senderID),
+			zap.String("group_id", payload.GroupId),
+			zap.Error(echoErr))
+	}
+	echoCancel()
+
 	// FCM wake-up: offline üyelere push at, ama gönderenin kendisini atla.
 	m.wakeUpOfflineGroupMembers(groupID, senderUUID)
 
@@ -632,6 +636,35 @@ func (m *connectionManager) handleGroupKeyDistribution(senderID, senderDeviceID 
 			zap.String("recipient_user_id", gkd.RecipientUserId),
 			zap.Error(err))
 		return
+	}
+
+	// Kalıcı kayıt: alıcı cihaz queue'su daha sonra oluşsa bile (yeni QR-auth
+	// web cihazı, fabrika reset sonrası Android, vs.) inbox drain bu satırı
+	// yeniden yayınlar. Sunucu encrypted_skdm içeriğini okumadığı için
+	// gizlilik etkilenmez.
+	if m.skdmRepo != nil {
+		senderUUID, errS := uuid.Parse(senderID)
+		senderDevUUID, errSD := uuid.Parse(senderDeviceID)
+		recipientUUID, errR := uuid.Parse(gkd.RecipientUserId)
+		groupUUID, errG := uuid.Parse(gkd.GroupId)
+		if errS == nil && errSD == nil && errR == nil && errG == nil {
+			row := &models.GroupSenderKeyDistribution{
+				SenderUserID:    senderUUID,
+				SenderDeviceID:  senderDevUUID,
+				RecipientUserID: recipientUUID,
+				GroupID:         groupUUID,
+				EncryptedSKDM:   gkd.EncryptedSkdm,
+				Nonce:           gkd.Nonce,
+			}
+			persistCtx, persistCancel := context.WithTimeout(context.Background(), userPublishTimeout)
+			if err := m.skdmRepo.Upsert(persistCtx, row); err != nil {
+				logger.Log.Warn("SKDM persist failed",
+					zap.String("group_id", gkd.GroupId),
+					zap.String("recipient_user_id", gkd.RecipientUserId),
+					zap.Error(err))
+			}
+			persistCancel()
+		}
 	}
 
 	logger.Log.Info("SKDM forwarded",

@@ -7,11 +7,13 @@ import (
 	"core-backend/pkg/logger"
 	"errors"
 
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
 type GroupBindingService interface {
+	ProvisionDeviceQueue(ctx context.Context, userID, deviceID uuid.UUID) error
 	BindUserToGroup(ctx context.Context, groupID, userID uuid.UUID) error
 	UnbindUserFromGroup(ctx context.Context, groupID, userID uuid.UUID) error
 	BindDeviceToAllGroups(ctx context.Context, userID, deviceID uuid.UUID) error
@@ -34,6 +36,35 @@ func NewGroupBindingService(
 		userRepo:  userRepo,
 		groupRepo: groupRepo,
 	}
+}
+
+func (s *groupBindingService) ProvisionDeviceQueue(ctx context.Context, userID, deviceID uuid.UUID) error {
+	userIDStr := userID.String()
+	deviceIDStr := deviceID.String()
+
+	ch, err := s.rabbit.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	if err := rabbitmq.DeclareUserDeviceQueue(ch, userIDStr, deviceIDStr); err != nil {
+		return err
+	}
+
+	queueName := rabbitmq.UserDeviceQueueName(userIDStr, deviceIDStr)
+	if err := ch.QueueBind(queueName, userIDStr, rabbitmq.ExchangeUser, false, nil); err != nil {
+		return err
+	}
+
+	if err := s.bindDeviceToAllGroups(ch, userID, deviceID); err != nil {
+		return err
+	}
+
+	logger.Log.Info("device queue provisioned",
+		zap.String("user_id", userIDStr),
+		zap.String("device_id", deviceIDStr))
+	return nil
 }
 
 func (s *groupBindingService) BindUserToGroup(ctx context.Context, groupID, userID uuid.UUID) error {
@@ -120,18 +151,23 @@ func (s *groupBindingService) UnbindUserFromGroup(ctx context.Context, groupID, 
 }
 
 func (s *groupBindingService) BindDeviceToAllGroups(ctx context.Context, userID, deviceID uuid.UUID) error {
-	groups, err := s.groupRepo.ListGroupsForUser(ctx, userID)
+	ch, err := s.rabbit.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+	return s.bindDeviceToAllGroups(ch, userID, deviceID)
+}
+
+func (s *groupBindingService) bindDeviceToAllGroups(ch *amqp.Channel, userID, deviceID uuid.UUID) error {
+	groups, err := s.groupRepo.ListGroupsForUser(context.Background(), userID)
 	if err != nil {
 		return err
 	}
 	if len(groups) == 0 {
 		return nil
 	}
-	ch, err := s.rabbit.Channel()
-	if err != nil {
-		return err
-	}
-	defer ch.Close()
+
 	queueName := rabbitmq.UserDeviceQueueName(userID.String(), deviceID.String())
 	var errs []error
 	for _, g := range groups {
