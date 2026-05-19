@@ -4,11 +4,13 @@ import (
 	"context"
 	"core-backend/internal/dto"
 	"core-backend/internal/rabbitmq"
+	"core-backend/internal/repositories"
 	"core-backend/pb"
 	"core-backend/pkg/logger"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
@@ -21,14 +23,19 @@ const (
 
 type MessageService interface {
 	DrainInbox(userID, deviceID string, limit int) (*dto.InboxResponse, error)
+	// SendReceipts WebSocket gönderilemediğinde REST fallback olarak çağrılır.
+	// Her makbuz için orijinal mesaj gönderenine RabbitMQ üzerinden iletilir.
+	// Best-effort: hata varsa loglanır, caller'a 200 dönülür.
+	SendReceipts(ctx context.Context, fromUserID, fromShadeID string, receipts []dto.ReceiptRequest) error
 }
 
 type messageService struct {
-	rabbit *rabbitmq.Client
+	rabbit  *rabbitmq.Client
+	msgRepo repositories.MessageRepository
 }
 
-func NewMessageService(rabbit *rabbitmq.Client) MessageService {
-	return &messageService{rabbit: rabbit}
+func NewMessageService(rabbit *rabbitmq.Client, msgRepo repositories.MessageRepository) MessageService {
+	return &messageService{rabbit: rabbit, msgRepo: msgRepo}
 }
 
 func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.InboxResponse, error) {
@@ -108,6 +115,108 @@ func (s *messageService) DrainInbox(userID, deviceID string, limit int) (*dto.In
 		zap.Int("receipts", len(response.Receipts)))
 
 	return response, nil
+}
+
+// SendReceipts — her makbuz için orijinal mesaj sahibine receipt iletir.
+func (s *messageService) SendReceipts(ctx context.Context, fromUserID, fromShadeID string, receipts []dto.ReceiptRequest) error {
+	if len(receipts) == 0 {
+		return nil
+	}
+
+	receiverUUID, err := uuid.Parse(fromUserID)
+	if err != nil {
+		return err
+	}
+
+	// Tüm messageId'leri parse et
+	var msgUUIDs []uuid.UUID
+	validReceipts := make([]dto.ReceiptRequest, 0, len(receipts))
+	for _, r := range receipts {
+		id, err := uuid.Parse(r.MessageID)
+		if err != nil {
+			continue
+		}
+		msgUUIDs = append(msgUUIDs, id)
+		validReceipts = append(validReceipts, r)
+	}
+	if len(msgUUIDs) == 0 {
+		return nil
+	}
+
+	// Orijinal mesajları DB'den çek — sender_id'yi bulmak için
+	msgs, err := s.msgRepo.GetMessagesByIDsForReceiver(ctx, receiverUUID, msgUUIDs)
+	if err != nil {
+		logger.Log.Warn("SendReceipts: DB lookup failed", zap.Error(err))
+		return nil // best-effort
+	}
+
+	// messageId → senderID haritası
+	senderMap := make(map[string]string, len(msgs))
+	for _, m := range msgs {
+		senderMap[m.MessageID.String()] = m.SenderID.String()
+	}
+
+	ch, err := s.rabbit.Channel()
+	if err != nil {
+		return err
+	}
+	defer ch.Close()
+
+	for _, r := range validReceipts {
+		originalSenderID, ok := senderMap[r.MessageID]
+		if !ok {
+			// Mesaj DB'de bulunamadı (grup mesajı veya eski kayıt) — atla
+			continue
+		}
+
+		status := pb.ReceiptStatus_READ
+		if r.Status == "DELIVERED" {
+			status = pb.ReceiptStatus_DELIVERED
+		}
+
+		wrapped := &pb.WebSocketMessage{
+			Content: &pb.WebSocketMessage_Receipt{
+				Receipt: &pb.DeliveryReceipt{
+					MessageId:     r.MessageID,
+					SenderId:      fromUserID,
+					SenderShadeId: fromShadeID,
+					ReceiverId:    originalSenderID,
+					Status:        status,
+					Timestamp:     time.Now().UnixMilli(),
+				},
+			},
+		}
+
+		body, err := proto.Marshal(wrapped)
+		if err != nil {
+			logger.Log.Warn("SendReceipts: proto marshal failed", zap.String("msg_id", r.MessageID), zap.Error(err))
+			continue
+		}
+
+		pubCtx, cancel := context.WithTimeout(ctx, receiptPublishTTL)
+		err = ch.PublishWithContext(pubCtx,
+			rabbitmq.ExchangeUser,
+			originalSenderID, // routing key = orijinal gönderen
+			false,
+			false,
+			amqp.Publishing{
+				ContentType:  "application/octet-stream",
+				Body:         body,
+				DeliveryMode: amqp.Persistent,
+				Timestamp:    time.Now(),
+			},
+		)
+		cancel()
+
+		if err != nil {
+			logger.Log.Warn("SendReceipts: publish failed",
+				zap.String("msg_id", r.MessageID),
+				zap.String("to", originalSenderID),
+				zap.Error(err))
+		}
+	}
+
+	return nil
 }
 
 func (s *messageService) publishDeliveredReceipt(ch *amqp.Channel, msgID, fromUserID, toSenderID, groupID string) error {

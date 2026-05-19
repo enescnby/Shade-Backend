@@ -70,13 +70,19 @@ func main() {
 	firebaseApp := firebase.InitFirebase()
 	firebaseService := services.NewFCMService(firebaseApp)
 
-	r2Client := storage.NewR2Client(&config.AppConfig)
-
 	keyRepo := repositories.NewKeyRepository(database.DB)
 	userRepo := repositories.NewUserRepository(database.DB)
 	auditRepo := repositories.NewAuditRepository(database.DB)
 	msgRepo := repositories.NewMessageRepository(database.DB)
-	mediaRepo := repositories.NewMediaRepository(database.DB, r2Client, config.AppConfig.R2BucketName)
+
+	var mediaRepo repositories.MediaRepository
+	if config.AppConfig.R2AccountID == "" || config.AppConfig.R2AccessKeyID == "" || config.AppConfig.R2AccessSecret == "" {
+		logger.Log.Warn("R2 credentials not configured — falling back to local disk storage")
+		mediaRepo = repositories.NewLocalMediaRepository(database.DB, "./uploads")
+	} else {
+		r2Client := storage.NewR2Client(&config.AppConfig)
+		mediaRepo = repositories.NewMediaRepository(database.DB, r2Client, config.AppConfig.R2BucketName)
+	}
 	webSessionRepo := repositories.NewWebSessionRepository(database.DB)
 	groupRepo := repositories.NewGroupRepository(database.DB)
 
@@ -84,7 +90,7 @@ func main() {
 	keyService := services.NewKeyService(keyRepo, userRepo)
 	userService := services.NewUserService(userRepo)
 	mediaService := services.NewMediaService(mediaRepo, 10*1024*1024)
-	messageService := services.NewMessageService(rabbitClient)
+	messageService := services.NewMessageService(rabbitClient, msgRepo)
 	webSessionService := services.NewSessionService(webSessionRepo, userRepo)
 	groupBindingService := services.NewGroupBindingService(rabbitClient, userRepo, groupRepo)
 	groupEventPublisher := services.NewGroupEventPublisher(rabbitClient)
@@ -131,6 +137,9 @@ func main() {
 
 	user := v1.Group("/user", middleware.Protected(), middleware.NewAPILimiter())
 	user.Get("/lookup/:shadeId", userHandler.GetUserForLookup)
+	user.Patch("/displayname", userHandler.UpdateDisplayName)
+	user.Patch("/avatar", userHandler.UpdateAvatar)
+	user.Delete("/avatar", userHandler.RemoveAvatar)
 
 	// ── Medya — dakikada 20 istek / IP (bant genişliği koruması) ────────────
 	media := v1.Group("/media", middleware.Protected(), middleware.NewMediaLimiter())
@@ -140,6 +149,7 @@ func main() {
 	// ── Mesajlar — genel API limiti ──────────────────────────────────────────
 	messages := v1.Group("/messages", middleware.Protected(), middleware.NewAPILimiter())
 	messages.Get("/inbox", messageHandler.GetInbox)
+	messages.Post("/receipts", messageHandler.PostReceipts)
 
 	// ── Gruplar ──────────────────────────────────────────────────────────────
 	groups := v1.Group("/groups", middleware.Protected(), middleware.NewAPILimiter())

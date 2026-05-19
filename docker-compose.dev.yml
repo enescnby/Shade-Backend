@@ -8,8 +8,9 @@ services:
       POSTGRES_USER: shade
       POSTGRES_PASSWORD: shade_dev_2026
       POSTGRES_DB: shade_db
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - shade_pgdata:/var/lib/postgresql/data
     healthcheck:

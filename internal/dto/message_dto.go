@@ -1,5 +1,16 @@
 package dto
 
+// ReceiptRequest — Android'den gelen tek bir makbuz (REST fallback)
+type ReceiptRequest struct {
+	MessageID string `json:"message_id"`
+	Status    string `json:"status"` // "READ" veya "DELIVERED"
+}
+
+// BatchReceiptRequest — POST /messages/receipts body
+type BatchReceiptRequest struct {
+	Receipts []ReceiptRequest `json:"receipts"`
+}
+
 type InboxMessage struct {
 	MessageID   string `json:"message_id"`
 	SenderID    string `json:"sender_id"`

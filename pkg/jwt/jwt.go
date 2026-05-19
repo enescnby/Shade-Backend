@@ -49,9 +49,13 @@ func ParseToken(tokenString string) (string, string, string, error) {
 		return "", "", "", errors.New("invalid token claims")
 	}
 
-	userID := claims["user_id"].(string)
-	coreGuardID := claims["core_guard_id"].(string)
-	deviceID := claims["device_id"].(string)
+	userID, ok1 := claims["user_id"].(string)
+	coreGuardID, ok2 := claims["core_guard_id"].(string)
+	if !ok1 || !ok2 {
+		return "", "", "", errors.New("missing required token claims")
+	}
+	// device_id eski token'larda olmayabilir — opsiyonel
+	deviceID, _ := claims["device_id"].(string)
 
 	return userID, coreGuardID, deviceID, nil
 }
