@@ -116,7 +116,7 @@ func TestMediaLimiter_MidLimit(t *testing.T) {
 		assert.Equal(t, 200, code, "Media limiter: istek %d 200 olmali", i+1)
 	}
 
-	// limit+1. istek — 429
+	// Sonraki istek limiti asmali — 429
 	code := makeRequest(app)
 	assert.Equal(t, 429, code, "Media limiter: %d. istek 429 olmali", limit+1)
 }
