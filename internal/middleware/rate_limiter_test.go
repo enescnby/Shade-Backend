@@ -108,17 +108,17 @@ func TestAPILimiter_HigherLimit(t *testing.T) {
 }
 
 func TestMediaLimiter_MidLimit(t *testing.T) {
-	app := testApp(middleware.NewMediaLimiter()) // limit: 20/dk
+	app := testApp(middleware.NewMediaLimiter())
+	limit := middleware.MediaLimitConfig.Limit
 
-	// 20 istek — hepsi gecmeli
-	for i := 0; i < 20; i++ {
+	for i := 0; i < limit; i++ {
 		code := makeRequest(app)
 		assert.Equal(t, 200, code, "Media limiter: istek %d 200 olmali", i+1)
 	}
 
-	// 21. istek — 429
+	// limit+1. istek — 429
 	code := makeRequest(app)
-	assert.Equal(t, 429, code, "Media limiter: 21. istek 429 olmali")
+	assert.Equal(t, 429, code, "Media limiter: %d. istek 429 olmali", limit+1)
 }
 
 // ── Sliding window davranişi ───────────────────────────────────────────────────
