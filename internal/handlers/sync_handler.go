@@ -47,7 +47,7 @@ func (h *SyncHandler) UpgradeAndServe(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "role must be 'android' or 'web'"})
 	}
 
-	sessionID := c.Params("session_id")
+	sessionID := string([]byte(c.Params("session_id")))
 	logger.Log.Info("sync upgrade: attempt", zap.String("session_id", sessionID), zap.String("role", role), zap.String("user_id", userID))
 
 	session, err := h.sessionSvc.GetSession(sessionID)

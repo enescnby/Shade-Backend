@@ -12,6 +12,8 @@ import (
 const (
 	SyncWriteTimeout = 10 * time.Second
 	WebReadyTimeout  = 15 * time.Second
+	FrameBufferTTL   = 10 * time.Second
+	FrameBufferSize  = 512
 	RoleAndroid      = "android"
 	RoleWeb          = "web"
 )
@@ -27,11 +29,20 @@ type syncConn struct {
 	writeMu sync.Mutex
 }
 
+type bufferedFrame struct {
+	msgType int
+	payload []byte
+}
+
 type syncSession struct {
-	android   *syncConn
-	web       *syncConn
-	connMu    sync.Mutex
-	webReady  chan struct{}
+	android  *syncConn
+	web      *syncConn
+	connMu   sync.Mutex
+	webReady chan struct{}
+	// frames buffers outgoing frames from android until (and after) web connects.
+	frames    chan bufferedFrame
+	done      chan struct{}
+	doneOnce  sync.Once
 	expiresAt time.Time
 }
 
@@ -56,9 +67,57 @@ func (m *syncManager) getOrCreate(sessionID string, expiresAt time.Time) *syncSe
 	s := &syncSession{
 		expiresAt: expiresAt,
 		webReady:  make(chan struct{}),
+		frames:    make(chan bufferedFrame, FrameBufferSize),
+		done:      make(chan struct{}),
 	}
 	m.sessions[sessionID] = s
+	go s.runForwarder(sessionID)
 	return s
+}
+
+// runForwarder waits up to FrameBufferTTL for the web client to connect, then
+// drains all buffered (and future) frames to the web connection in order.
+func (s *syncSession) runForwarder(sessionID string) {
+	select {
+	case <-s.webReady:
+	case <-time.After(FrameBufferTTL):
+		logger.Log.Warn("frame buffer TTL expired, discarding buffered frames",
+			zap.String("session_id", sessionID),
+			zap.Duration("ttl", FrameBufferTTL))
+		return
+	case <-s.done:
+		return
+	}
+
+	for {
+		select {
+		case f := <-s.frames:
+			s.connMu.Lock()
+			web := s.web
+			s.connMu.Unlock()
+
+			if web == nil {
+				continue
+			}
+
+			web.writeMu.Lock()
+			_ = web.conn.SetWriteDeadline(time.Now().Add(SyncWriteTimeout))
+			err := web.conn.WriteMessage(f.msgType, f.payload)
+			_ = web.conn.SetWriteDeadline(time.Time{})
+			web.writeMu.Unlock()
+
+			if err != nil {
+				logger.Log.Error("sync forward to web failed",
+					zap.String("session_id", sessionID), zap.Error(err))
+			} else {
+				logger.Log.Info("sync frame forwarded to web",
+					zap.String("session_id", sessionID), zap.Int("bytes", len(f.payload)))
+			}
+
+		case <-s.done:
+			return
+		}
+	}
 }
 
 func (m *syncManager) Register(sessionID, role string, conn *websocket.Conn, expiresAt time.Time) error {
@@ -71,7 +130,7 @@ func (m *syncManager) Register(sessionID, role string, conn *websocket.Conn, exp
 		s.android = sc
 	case RoleWeb:
 		s.web = sc
-		// Signal android that web is ready (non-blocking, idempotent)
+		// Signal the forwarder that web is ready (non-blocking, idempotent).
 		select {
 		case <-s.webReady:
 		default:
@@ -80,36 +139,23 @@ func (m *syncManager) Register(sessionID, role string, conn *websocket.Conn, exp
 	}
 	s.connMu.Unlock()
 
-	logger.Log.Info("sync connection registered", zap.String("session_id", sessionID), zap.String("role", role))
+	logger.Log.Info("sync connection registered",
+		zap.String("session_id", sessionID), zap.String("role", role))
 	return nil
 }
 
 func (m *syncManager) ReadPump(sessionID, role string, conn *websocket.Conn) {
-	if role == RoleAndroid {
-		m.mu.RLock()
-		s, ok := m.sessions[sessionID]
-		m.mu.RUnlock()
-
-		if ok {
-			select {
-			case <-s.webReady:
-			case <-time.After(WebReadyTimeout):
-				logger.Log.Warn("android timed out waiting for web", zap.String("session_id", sessionID))
-				_ = conn.WriteMessage(websocket.CloseMessage,
-					websocket.FormatCloseMessage(4408, "web client did not connect in time"))
-				return
-			}
-		}
-	}
-
 	for {
 		msgType, payload, err := conn.ReadMessage()
 		if err != nil {
-			logger.Log.Info("sync read pump closed", zap.String("session_id", sessionID), zap.String("role", role), zap.Error(err))
+			logger.Log.Info("sync read pump closed",
+				zap.String("session_id", sessionID), zap.String("role", role), zap.Error(err))
 			break
 		}
 
-		logger.Log.Info("sync message received", zap.String("session_id", sessionID), zap.String("role", role), zap.Int("msg_type", msgType), zap.Int("payload_bytes", len(payload)))
+		logger.Log.Info("sync message received",
+			zap.String("session_id", sessionID), zap.String("role", role),
+			zap.Int("msg_type", msgType), zap.Int("payload_bytes", len(payload)))
 
 		if role != RoleAndroid || (msgType != websocket.TextMessage && msgType != websocket.BinaryMessage) {
 			continue
@@ -129,23 +175,11 @@ func (m *syncManager) ReadPump(sessionID, role string, conn *websocket.Conn) {
 			break
 		}
 
-		s.connMu.Lock()
-		web := s.web
-		s.connMu.Unlock()
-
-		if web == nil {
-			continue
-		}
-
-		web.writeMu.Lock()
-		_ = web.conn.SetWriteDeadline(time.Now().Add(SyncWriteTimeout))
-		err = web.conn.WriteMessage(msgType, payload)
-		_ = web.conn.SetWriteDeadline(time.Time{})
-		web.writeMu.Unlock()
-		if err != nil {
-			logger.Log.Error("sync forward to web failed", zap.String("session_id", sessionID), zap.Error(err))
-		} else {
-			logger.Log.Info("sync message forwarded to web", zap.String("session_id", sessionID), zap.Int("payload_bytes", len(payload)))
+		select {
+		case s.frames <- bufferedFrame{msgType: msgType, payload: payload}:
+		default:
+			logger.Log.Warn("sync frame buffer full, dropping frame",
+				zap.String("session_id", sessionID))
 		}
 	}
 }
@@ -176,6 +210,7 @@ func (m *syncManager) Unregister(sessionID, role string, conn *websocket.Conn) {
 	s.connMu.Unlock()
 
 	if bothNil {
+		s.doneOnce.Do(func() { close(s.done) })
 		delete(m.sessions, sessionID)
 		logger.Log.Info("sync session cleaned up", zap.String("session_id", sessionID))
 	}
